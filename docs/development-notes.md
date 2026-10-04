@@ -2426,6 +2426,18 @@ were racing the same threads one layer up (one run tore down ultramodern's
 message queues while a game thread was dequeuing from one). Restore both once
 game threads are joined rather than abandoned.
 
+**One exception, added 2026-10-04: an Android restart returns instead.** The
+`_Exit` predates the Android port, and it silently broke **Settings → Restart**
+there from the day that feature landed: the relaunch is done by
+`MainActivity.onDestroy()` handing off to `RestartActivity`, and `onDestroy` only
+runs after `SDL_main` returns — so `_Exit` killed the process first and the player
+landed on the home screen (logcat: `request_restart(2)`, then Zygote `exited
+cleanly (0)`, no `RestartActivity`). Returning is safe on Android where it is not
+on desktop: SDL's `nativeRunMain` does not call `exit()` after `SDL_main`, and
+`RestartActivity` ends the old process with `killProcess`, so no static destructor
+runs either way. A plain Quit still `_Exit`s. Verified on the RP5: To Title
+Screen and To App Menu both relaunch, and Quit still exits without one.
+
 **The moral is worth keeping.** A crash reported at a plausible address, in
 plausible code, with a plausible backtrace, was an artefact of how the run was
 stopped. The fault address and `si_code` are what separated the two, and neither

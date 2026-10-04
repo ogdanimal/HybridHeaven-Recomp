@@ -2761,5 +2761,18 @@ int main(int argc, char** argv) {
     // game thread was still dequeuing from one. `_Exit` skips all of it and lets
     // the kernel reclaim everything, which is what a process on its way out
     // wants regardless. Replace this with a real join when there is one to make.
+#if defined(__ANDROID__)
+    // Except for an Android restart, which this process is NOT on its way out
+    // of yet: the relaunch is done by MainActivity.onDestroy() -> RestartActivity,
+    // and onDestroy only runs once SDL_main returns and SDLActivity finishes the
+    // activity. _Exit here killed the process first, so Restart came back to the
+    // home screen instead of the game. Returning is safe on Android in a way it
+    // is not on desktop: SDL's nativeRunMain does not exit() after SDL_main, so
+    // no static destructors run, and RestartActivity then takes this process
+    // down with killProcess, which runs none either. A plain quit still _Exits.
+    if (hybridheaven::restart_requested()) {
+        return EXIT_SUCCESS;
+    }
+#endif
     std::_Exit(EXIT_SUCCESS);
 }

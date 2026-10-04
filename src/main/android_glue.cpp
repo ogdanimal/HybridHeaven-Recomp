@@ -242,6 +242,10 @@ namespace hybridheaven {
         ultramodern::quit();
     }
 
+    bool restart_requested() {
+        return g_restart_target.load() != static_cast<int>(RestartTarget::None);
+    }
+
     // Called by the render context once a Vulkan device is up, with the name of
     // the device that was actually selected.
     //

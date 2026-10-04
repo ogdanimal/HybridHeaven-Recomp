@@ -41,6 +41,11 @@ namespace hybridheaven {
     };
     void request_restart(RestartTarget target);
 
+    // True once request_restart() has been called. game_main() checks it on the
+    // way out: a restart is carried out by MainActivity.onDestroy(), which only
+    // runs if game_main() RETURNS -- see the end of main.cpp.
+    bool restart_requested();
+
     // Ask the Android layer to put the on-screen controls into layout-edit mode over
     // the running game. Harmless if the activity has gone.
     void request_touch_layout_editor();
