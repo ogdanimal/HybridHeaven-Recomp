@@ -1,0 +1,90 @@
+# Config file for the Hybrid Heaven (USA) recompilation.
+#
+# Structure mirrors Goemon64Recomp/mnsg.toml -- same stack, same Konami ROM
+# format, same IDO/libultra-2.0H build. Hybrid Heaven's overlays are NOT
+# TLB-mapped the way Goemon's are, so only the structure is copied, not the
+# overlay handling.
+#
+# This uses elf_path where mnsg.toml uses symbols_file_path, and it has to.
+# Hybrid Heaven calls across section boundaries -- .main into .file_7, .file_23
+# into .file_7 -- and the .syms.toml format cannot express that: --dump-context
+# emits a reloc only when `reloc.target_section == section_index` (main.cpp),
+# and the parser assigns `target_section = section_index` unconditionally
+# (config.cpp), because the toml entry carries only a target_vram. So every
+# cross-section reloc is dropped on the way out and unrecoverable on the way in,
+# and those calls fail with "No function found for jal target".
+#
+# Goemon gets away with symbols mode because its .main never calls into an
+# overlay directly. The Syms repo is still generated and still useful for mods;
+# it just cannot drive this recompilation.
+#
+# elf_path points into the decomp submodule, which must be built first:
+#   cd lib/hybridheaven && make setup && make   # must print 61ed3d5d...
+
+[input]
+entrypoint = 0x80000400
+output_func_path = "RecompiledFuncs"
+relocatable_sections_path = "hybridheaven.overlays.txt"
+elf_path = "lib/hybridheaven/build/usa/hybridheaven.elf"
+trace_mode = true
+
+# splat emits overlay bss as `.file_<i>_bss` and the static segment's as
+# `.main_bss`; N64Recomp pairs a bss section to its parent by stripping this
+# suffix from the name.
+bss_section_suffix = "_bss"
+
+# 11 of the 7367 relocs in .main are orphaned LO16s -- a LO16 with no HI16
+# immediately before it. The MIPS System V ABI says such a reloc reuses the
+# previously defined HI16, which is exactly what N64Recomp does, so the warnings
+# are noise rather than a problem to fix.
+unpaired_lo16_warnings = false
+
+[patches]
+stubs = [
+]
+
+# rspboot is RSP microcode, not VR4300 code, but it begins at ROM 0x35CD0 --
+# 0x60 bytes BEFORE the .text/.data cut at 0x35D30 -- so its first 0x60 bytes
+# trail into .text and splat labels them as two functions. Decoding them as
+# VR4300 yields nonsense (both contain a `jal 0x8400103C`, an address in no
+# section). They are never executed by the recompiled game: the RSP task runs
+# via rsp/aspMain.cpp. Skip them.
+ignored = [
+    "func_800350D0_35CD0",
+    "func_800350D8_35CD8",
+]
+
+# The osAiGetLength audio-buffer underflow. Goemon needed the same fix, and this
+# game has the same bug in the same shape -- but it had to be found here rather
+# than copied, because the target is a GAME audio function (func_8001FD14_20914)
+# rather than libultra, exactly as expected.
+#
+# The sequence at 0x8001FD54 is:
+#
+#   jal   osAiGetLength                  -> $v0
+#   srl   $t7, $v0, 2                    queued frames
+#   subu  $t8, $t6, $t7                  target - queued   <-- can go NEGATIVE
+#   addiu $t9, $t8, 0x100
+#   andi  $t1, $t9, 0xFFF0
+#   sh    $t1, 0x4($s0)                  stored as a halfword
+#   lh    $a3, 0x4($s0)                  reloaded SIGN-EXTENDED
+#   sltu  $at, $a3, $v1                  clamp against the max
+#   beqz  $at, .L8001FDA0                skip the clamp when not less
+#   sh    $v1, 0x4($s0)
+#
+# When osAiGetLength returns more than the target, the subu underflows. The value
+# round-trips through sh/lh, so $a3 comes back sign-extended and negative, and the
+# UNSIGNED compare reads that as a huge number -- the clamp is skipped and the
+# negative length reaches osAiSetNextBuffer. ultramodern's queue_audio_buffer then
+# computes byte_count / 2 and reads ~2^31 samples off the end of rdram.
+#
+# Observed directly before the fix: six good buffers of 1440-1984 samples, then
+# one of 2147480224 (byte_count 0xFFFFE440, i.e. -7104), then a segfault.
+#
+# Making the comparison signed lets the clamp catch the negative case. This is the
+# identical instruction to Goemon's, in the same registers, with the same
+# replacement value -- 0x00E3082B sltu -> 0x00E3082A slt.
+[[patches.instruction]]
+func = "func_8001FD14_20914"
+vram = 0x8001FD8C
+value = 0x00E3082A # sltu $at, $a3, $v1 -> slt $at, $a3, $v1

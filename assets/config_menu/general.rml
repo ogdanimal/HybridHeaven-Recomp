@@ -1,0 +1,310 @@
+<template name="config-menu__general">
+    <head>
+    </head>
+    <body>
+        <form class="config__form" id="conf-general__form">
+            <div class="config__hz-wrapper" id="conf-general__hz-wrapper">
+                <!-- Options -->
+                <div class="config__wrapper" data-event-mouseout="set_cur_config_index(-1)" id="conf-general__wrapper">
+                    <!-- rumble strength -->
+                    <div class="config-option" data-event-mouseover="set_cur_config_index(1)">
+                        <label class="config-option__title">Rumble Strength</label>
+                        <div class="config-option__range-wrapper config-option__list">
+                            <label class="config-option__range-label">{{rumble_strength}}%</label>
+                            <input
+                                class="nav-vert"
+                                data-event-blur="set_cur_config_index(-1)"
+                                data-event-focus="set_cur_config_index(1)"
+                                id="rumble_strength_input"
+                                type="range"
+                                min="0"
+                                max="100"
+                                style="flex: 1; margin: 0dp; nav-down: #joystick_deadzone_input"
+                                data-value="rumble_strength"
+                            />
+                        </div>
+                    </div>
+
+                    <!-- joystick deadzone -->
+                    <div class="config-option" data-event-mouseover="set_cur_config_index(4)">
+                        <label class="config-option__title">Joystick Deadzone</label>
+                        <div class="config-option__range-wrapper config-option__list">
+                            <label class="config-option__range-label">{{joystick_deadzone}}%</label>
+                            <input
+                                class="nav-vert"
+                                data-event-blur="set_cur_config_index(-1)"
+                                data-event-focus="set_cur_config_index(4)"
+                                id="joystick_deadzone_input"
+                                type="range"
+                                min="0"
+                                max="100"
+                                style="flex: 1; margin: 0dp; nav-up: #rumble_strength_input; nav-down: #bg_input_enabled"
+                                data-value="joystick_deadzone"
+                            />
+                        </div>
+                    </div>
+
+                    <!-- background input -->
+                    <div class="config-option" data-event-mouseover="set_cur_config_index(5)" id="conf-general__Background-Input">
+                        <label class="config-option__title">Background Input</label>
+                        <div class="config-option__list">
+                            <input
+                                type="radio"
+                                data-event-blur="set_cur_config_index(-1)"
+                                data-event-focus="set_cur_config_index(5)"
+                                name="background_input_mode"
+                                data-checked="background_input_mode"
+                                value="On"
+                                id="bg_input_enabled"
+                                style="nav-up: #joystick_deadzone_input; nav-down: #analog_cam_enabled"
+                            />
+                            <label class="config-option__tab-label" for="bg_input_enabled">On</label>
+
+                            <input
+                                type="radio"
+                                data-event-blur="set_cur_config_index(-1)"
+                                data-event-focus="set_cur_config_index(5)"
+                                name="background_input_mode"
+                                data-checked="background_input_mode"
+                                value="Off"
+                                id="bg_input_disabled"
+                                style="nav-up: #joystick_deadzone_input; nav-down: #analog_cam_disabled"
+                            />
+                            <label class="config-option__tab-label" for="bg_input_disabled">Off</label>
+                        </div>
+                    </div>
+
+                    <!-- analog camera -->
+                    <div class="config-option" data-event-mouseover="set_cur_config_index(6)" id="conf-general__Analog-Camera">
+                        <label class="config-option__title">Analog Camera</label>
+                        <div class="config-option__list">
+                            <input
+                                type="radio"
+                                data-event-blur="set_cur_config_index(-1)"
+                                data-event-focus="set_cur_config_index(6)"
+                                name="analog_cam_mode"
+                                data-checked="analog_cam_mode"
+                                value="On"
+                                id="analog_cam_enabled"
+                                style="nav-up: #bg_input_enabled"
+                                data-style-nav-down="analog_cam_mode == 'Off' ? '#autosave_enabled' : '#acam_invert_none'"
+                            />
+                            <label class="config-option__tab-label" for="analog_cam_enabled">On</label>
+
+                            <input
+                                type="radio"
+                                data-event-blur="set_cur_config_index(-1)"
+                                data-event-focus="set_cur_config_index(6)"
+                                name="analog_cam_mode"
+                                data-checked="analog_cam_mode"
+                                value="Off"
+                                id="analog_cam_disabled"
+                                style="nav-up: #bg_input_disabled"
+                                data-style-nav-down="analog_cam_mode == 'Off' ? '#autosave_disabled' : '#acam_invert_none'"
+                            />
+                            <label class="config-option__tab-label" for="analog_cam_disabled">Off</label>
+                        </div>
+                    </div>
+
+                    <!-- analog camera invert (only meaningful with Analog Camera on) -->
+                    <div class="config-option" data-class-config-option--disabled="analog_cam_mode == 'Off'" data-event-mouseover="set_cur_config_index(7)" id="conf-general__Analog-Cam-Invert">
+                        <label class="config-option__title">Analog Camera Invert</label>
+                        <div class="config-option__list">
+                            <input
+                                type="radio"
+                                data-event-blur="set_cur_config_index(-1)"
+                                data-event-focus="set_cur_config_index(7)"
+                                name="analog_camera_invert_mode"
+                                data-checked="analog_camera_invert_mode"
+                                data-attrif-disabled="analog_cam_mode == 'Off'"
+                                value="InvertNone"
+                                id="acam_invert_none"
+                                style="nav-up: #analog_cam_enabled; nav-down: #acam_sens_x_input"
+                            />
+                            <label class="config-option__tab-label" for="acam_invert_none">None</label>
+
+                            <input
+                                type="radio"
+                                data-event-blur="set_cur_config_index(-1)"
+                                data-event-focus="set_cur_config_index(7)"
+                                name="analog_camera_invert_mode"
+                                data-checked="analog_camera_invert_mode"
+                                data-attrif-disabled="analog_cam_mode == 'Off'"
+                                value="InvertX"
+                                id="acam_invert_x"
+                                style="nav-up: #analog_cam_enabled; nav-down: #acam_sens_x_input"
+                            />
+                            <label class="config-option__tab-label" for="acam_invert_x">X</label>
+
+                            <input
+                                type="radio"
+                                data-event-blur="set_cur_config_index(-1)"
+                                data-event-focus="set_cur_config_index(7)"
+                                name="analog_camera_invert_mode"
+                                data-checked="analog_camera_invert_mode"
+                                data-attrif-disabled="analog_cam_mode == 'Off'"
+                                value="InvertY"
+                                id="acam_invert_y"
+                                style="nav-up: #analog_cam_disabled; nav-down: #acam_sens_x_input"
+                            />
+                            <label class="config-option__tab-label" for="acam_invert_y">Y</label>
+
+                            <input
+                                type="radio"
+                                data-event-blur="set_cur_config_index(-1)"
+                                data-event-focus="set_cur_config_index(7)"
+                                name="analog_camera_invert_mode"
+                                data-checked="analog_camera_invert_mode"
+                                data-attrif-disabled="analog_cam_mode == 'Off'"
+                                value="InvertBoth"
+                                id="acam_invert_both"
+                                style="nav-up: #analog_cam_disabled; nav-down: #acam_sens_x_input"
+                            />
+                            <label class="config-option__tab-label" for="acam_invert_both">Both</label>
+                        </div>
+                    </div>
+
+                    <!-- analog camera sensitivity, horizontal -->
+                    <div class="config-option" data-class-config-option--disabled="analog_cam_mode == 'Off'" data-event-mouseover="set_cur_config_index(8)" id="conf-general__Analog-Cam-Sens-X">
+                        <label class="config-option__title">Analog Camera Sensitivity (Horizontal)</label>
+                        <div class="config-option__range-wrapper config-option__list">
+                            <label class="config-option__range-label">{{analog_cam_sensitivity_x}}%</label>
+                            <input
+                                class="nav-vert"
+                                data-event-blur="set_cur_config_index(-1)"
+                                data-event-focus="set_cur_config_index(8)"
+                                data-attrif-disabled="analog_cam_mode == 'Off'"
+                                id="acam_sens_x_input"
+                                type="range"
+                                min="0"
+                                max="100"
+                                style="flex: 1; margin: 0dp; nav-up: #acam_invert_none; nav-down: #acam_sens_y_input"
+                                data-value="analog_cam_sensitivity_x"
+                            />
+                        </div>
+                    </div>
+
+                    <!-- analog camera sensitivity, vertical -->
+                    <div class="config-option" data-class-config-option--disabled="analog_cam_mode == 'Off'" data-event-mouseover="set_cur_config_index(9)" id="conf-general__Analog-Cam-Sens-Y">
+                        <label class="config-option__title">Analog Camera Sensitivity (Vertical)</label>
+                        <div class="config-option__range-wrapper config-option__list">
+                            <label class="config-option__range-label">{{analog_cam_sensitivity_y}}%</label>
+                            <input
+                                class="nav-vert"
+                                data-event-blur="set_cur_config_index(-1)"
+                                data-event-focus="set_cur_config_index(9)"
+                                data-attrif-disabled="analog_cam_mode == 'Off'"
+                                id="acam_sens_y_input"
+                                type="range"
+                                min="0"
+                                max="100"
+                                style="flex: 1; margin: 0dp; nav-up: #acam_sens_x_input; nav-down: #autosave_enabled"
+                                data-value="analog_cam_sensitivity_y"
+                            />
+                        </div>
+                    </div>
+
+                    <!-- autosave -->
+                    <div class="config-option" data-event-mouseover="set_cur_config_index(10)" id="conf-general__Autosave">
+                        <label class="config-option__title">Autosave</label>
+                        <div class="config-option__list">
+                            <input
+                                type="radio"
+                                data-event-blur="set_cur_config_index(-1)"
+                                data-event-focus="set_cur_config_index(10)"
+                                name="autosave_mode"
+                                data-checked="autosave_mode"
+                                value="On"
+                                id="autosave_enabled"
+                                data-style-nav-up="analog_cam_mode == 'Off' ? '#analog_cam_enabled' : '#acam_sens_y_input'"
+                                style="nav-down: #debug_mode_enabled"
+                            />
+                            <label class="config-option__tab-label" for="autosave_enabled">On</label>
+
+                            <input
+                                type="radio"
+                                data-event-blur="set_cur_config_index(-1)"
+                                data-event-focus="set_cur_config_index(10)"
+                                name="autosave_mode"
+                                data-checked="autosave_mode"
+                                value="Off"
+                                id="autosave_disabled"
+                                data-style-nav-up="analog_cam_mode == 'Off' ? '#analog_cam_disabled' : '#acam_sens_y_input'"
+                                style="nav-down: #debug_mode_disabled"
+                            />
+                            <label class="config-option__tab-label" for="autosave_disabled">Off</label>
+                        </div>
+                    </div>
+
+                    <!-- UI inspector (F8) -->
+                    <div class="config-option" data-event-mouseover="set_cur_config_index(14)" id="conf-general__UI-Inspector">
+                        <label class="config-option__title">UI Inspector</label>
+                        <div class="config-option__list">
+                            <input
+                                type="radio"
+                                data-event-blur="set_cur_config_index(-1)"
+                                data-event-focus="set_cur_config_index(14)"
+                                name="debug_mode"
+                                data-checked="debug_mode"
+                                value="1"
+                                id="debug_mode_enabled"
+                                style="nav-up: #autosave_enabled"
+                            />
+                            <label class="config-option__tab-label" for="debug_mode_enabled">On</label>
+
+                            <input
+                                type="radio"
+                                data-event-blur="set_cur_config_index(-1)"
+                                data-event-focus="set_cur_config_index(14)"
+                                name="debug_mode"
+                                data-checked="debug_mode"
+                                value="0"
+                                id="debug_mode_disabled"
+                                style="nav-up: #autosave_disabled"
+                            />
+                            <label class="config-option__tab-label" for="debug_mode_disabled">Off</label>
+                        </div>
+                    </div>
+                </div>
+                <!-- Descriptions -->
+                <div class="config__wrapper">
+                    <p data-if="cur_config_index == 1">
+                        Controls the strength of rumble when using a controller that supports it. <b>Setting this to zero will disable rumble.</b>
+                    </p>
+                    <p data-if="cur_config_index == 4">
+                        Applies a deadzone to joystick inputs.
+                    </p>
+                    <p data-if="cur_config_index == 5">
+                        Allows the game to read controller input when out of focus.
+                        <br/>
+                        <b>This setting does not affect keyboard input.</b>
+                    </p>
+                    <p data-if="cur_config_index == 6">
+                        Lets the <b>right stick</b> move the camera freely while you walk.
+                        <br/>
+                        <br/>
+                        Hybrid Heaven's own camera control does not go away: holding <b>C-left</b> or <b>C-down</b> still swaps the left stick over to the camera. This adds a second way that does not interrupt what you are doing. Click the <b>right stick (R3)</b> to hand the camera back to the game.
+                        <br/>
+                        <br/>
+                        While this is on, the right stick no longer doubles as the C-buttons — use the <b>D-Pad</b> for those.
+                    </p>
+                    <p data-if="cur_config_index == 7">
+                        Flips the direction the analog camera turns, per axis.
+                    </p>
+                    <p data-if="cur_config_index == 8">
+                        How fast the analog camera turns left and right. <b>50% is the tuned default</b>; 0% stops that axis.
+                    </p>
+                    <p data-if="cur_config_index == 9">
+                        How fast the analog camera tilts up and down. <b>50% is the tuned default</b>; 0% stops that axis.
+                    </p>
+                    <p data-if="cur_config_index == 14">
+                        Enables the <b>F8</b> key, which opens the RmlUi inspector over this menu: a live view of the interface's own element tree and styles.
+                        <br/>
+                        <br/>
+                        This inspects the <b>port's menus</b>, not the game. It has no effect on how the game runs.
+                    </p>
+                </div>
+            </div>
+        </form>
+    </body>
+</template>

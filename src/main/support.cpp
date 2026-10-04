@@ -1,0 +1,140 @@
+#include "hh_support.h"
+#include <SDL.h>
+#if !defined(__ANDROID__)
+#include "nfd.h"
+#endif
+#include "RmlUi/Core.h"
+
+namespace hybridheaven {
+    // MARK: - Internal Helpers
+#if defined(__ANDROID__)
+    // Android has no native file dialog: picking a file means the Storage Access
+    // Framework, which is Java, asynchronous, and hands back a content:// URI
+    // rather than a path. android_request_open_document() bridges all three --
+    // the document is copied into the cache and the callback is delivered on this
+    // (render) thread, which is where the desktop implementations below run
+    // theirs. The only visible difference is that the callback runs after this
+    // function has returned instead of during it.
+    void perform_file_dialog_operation(const std::function<void(bool, const std::filesystem::path&)>& callback) {
+        android_request_open_document(/*multiple=*/false,
+            [callback](bool success, const std::list<std::filesystem::path>& paths) {
+                callback(success && !paths.empty(), paths.empty() ? std::filesystem::path{} : paths.front());
+            });
+    }
+
+    void perform_file_dialog_operation_multiple(const std::function<void(bool, const std::list<std::filesystem::path>&)>& callback) {
+        android_request_open_document(/*multiple=*/true, callback);
+    }
+#else
+    void perform_file_dialog_operation(const std::function<void(bool, const std::filesystem::path&)>& callback) {
+        nfdnchar_t* native_path = nullptr;
+        nfdresult_t result = NFD_OpenDialogN(&native_path, nullptr, 0, nullptr);
+
+        bool success = (result == NFD_OKAY);
+        std::filesystem::path path;
+
+        if (success) {
+            path = std::filesystem::path{native_path};
+            NFD_FreePathN(native_path);
+        }
+
+        callback(success, path);
+    }
+
+    void perform_file_dialog_operation_multiple(const std::function<void(bool, const std::list<std::filesystem::path>&)>& callback) {
+        const nfdpathset_t* native_paths = nullptr;
+        nfdresult_t result = NFD_OpenDialogMultipleN(&native_paths, nullptr, 0, nullptr);
+
+        bool success = (result == NFD_OKAY);
+        std::list<std::filesystem::path> paths;
+        nfdpathsetsize_t count = 0;
+
+        if (success) {
+            NFD_PathSet_GetCount(native_paths, &count);
+            for (nfdpathsetsize_t i = 0; i < count; i++) {
+                nfdnchar_t* cur_path = nullptr;
+                nfdresult_t cur_result = NFD_PathSet_GetPathN(native_paths, i, &cur_path);
+                if (cur_result == NFD_OKAY) {
+                    paths.emplace_back(std::filesystem::path{cur_path});
+                }
+            }
+            NFD_PathSet_Free(native_paths);
+        }
+
+        callback(success, paths);
+    }
+#endif
+
+    // MARK: - Public API
+
+    std::filesystem::path get_program_path() {
+#if defined(__ANDROID__)
+        // App-private storage, set by MainActivity.nativeInit(); assets and
+        // recompcontrollerdb.txt are extracted here from the APK on first launch.
+        return android_program_path();
+#elif defined(__APPLE__)
+        return get_bundle_resource_directory();
+#elif defined(__linux__) && defined(RECOMP_FLATPAK)
+        return "/app/bin";
+#elif defined(_WIN32)
+        // The directory holding the .exe, not the working directory. The empty
+        // path below makes every asset relative to the cwd, which is fine on
+        // Linux because runs are launched from the repository root -- and is not
+        // fine on Windows, where a .exe is normally started from somewhere else
+        // entirely. It cost a whole afternoon: with no assets/ beside the cwd the
+        // port aborted inside init_styling with no message at all, which read as
+        // a renderer failure because it happens on the gfx thread inside RT64's
+        // setup. Shipping a Windows build means the .exe and assets/ travel
+        // together, so the .exe is what to resolve against.
+        //
+        // SDL_GetBasePath rather than GetModuleFileNameW: SDL is already a
+        // dependency here, it returns the trailing separator either way, and it
+        // keeps <windows.h> out of this file.
+        std::filesystem::path base;
+        if (char* sdl_base = SDL_GetBasePath()) {
+            base = std::filesystem::path{sdl_base};
+            SDL_free(sdl_base);
+        }
+        return base;
+#else
+        return "";
+#endif
+    }
+
+    std::filesystem::path get_asset_path(const char* asset) {
+        return get_program_path() / "assets" / asset;
+    }
+
+    void open_file_dialog(std::function<void(bool success, const std::filesystem::path& path)> callback) {
+#ifdef __APPLE__
+        dispatch_on_ui_thread([callback]() {
+            perform_file_dialog_operation(callback);
+        });
+#else
+        perform_file_dialog_operation(callback);
+#endif
+    }
+
+    void open_file_dialog_multiple(std::function<void(bool success, const std::list<std::filesystem::path>& paths)> callback) {
+#ifdef __APPLE__
+        dispatch_on_ui_thread([callback]() {
+            perform_file_dialog_operation_multiple(callback);
+        });
+#else
+        perform_file_dialog_operation_multiple(callback);
+#endif
+    }
+
+    void show_error_message_box(const char *title, const char *message) {
+#ifdef __APPLE__
+    std::string title_copy(title);
+    std::string message_copy(message);
+
+    dispatch_on_ui_thread([title_copy, message_copy] {
+        SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, title_copy.c_str(), message_copy.c_str(), nullptr);
+    });
+#else
+        SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, title, message, nullptr);
+#endif
+    }
+}

@@ -1,0 +1,30 @@
+--- a/src/main.cpp	2026-07-26 15:05:53.002371083 -0400
++++ b/src/main.cpp	2026-07-26 15:29:23.329425431 -0400
+@@ -794,7 +794,7 @@
+ 
+             // Search for the closest function 
+             size_t closest_func_index = 0;
+-            while (section_funcs[closest_func_index] < static_func_addr && closest_func_index < section_funcs.size()) {
++            while (closest_func_index < section_funcs.size() && section_funcs[closest_func_index] < static_func_addr) {
+                 closest_func_index++;
+             }
+ 
+--- a/src/recompilation.cpp	2026-07-26 15:05:53.002371083 -0400
++++ b/src/recompilation.cpp	2026-07-26 15:28:05.140052726 -0400
+@@ -311,6 +311,16 @@
+                         jal_target_name = context.functions[matched_func_index].name;
+                         break;
+                     case JalResolutionResult::CreateStatic:
++                        // `resolve_jal` decided the target lies inside `target_section`, which is the
++                        // reloc's section and not necessarily this function's own. Registering the
++                        // static under `func.section_index` in that case records an address outside
++                        // that section, which later reads out of bounds when the static's extent is
++                        // computed. A call that crosses between two relocatable sections has to be
++                        // resolved at runtime anyway, so fall back to lookup.
++                        if (target_section != func.section_index) {
++                            call_by_lookup = true;
++                            break;
++                        }
+                         // Create a static function add it to the static function list for this section.
+                         jal_target_name = fmt::format("static_{}_{:08X}", func.section_index, target_func_vram);
+                         static_funcs_out[func.section_index].push_back(target_func_vram);

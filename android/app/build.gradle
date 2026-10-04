@@ -1,0 +1,188 @@
+plugins {
+    id 'com.android.application'
+}
+
+// Load signing credentials from keystore.properties (support both root and android/ locations).
+def keystoreProperties = new Properties()
+def keystorePropertiesFile = rootProject.file("keystore.properties")
+if (!keystorePropertiesFile.exists()) {
+    keystorePropertiesFile = rootProject.file("android/keystore.properties")
+}
+if (keystorePropertiesFile.exists()) {
+    keystoreProperties.load(new FileInputStream(keystorePropertiesFile))
+}
+
+// Host-built tools the cross-compiled build has to run on the build machine --
+// an arm64 file_to_c could not execute here. It turns shaders and blobs into C
+// source, so it runs during the build and none of it ships. The path is relative
+// to the repo root, two levels up from android/app.
+//
+// Checked here as well as in CMakeLists.txt: the FATAL_ERROR there does catch a
+// missing path, but it surfaces hundreds of lines into a gradle log as a
+// configure failure, and the fix is a one-line compile that belongs beside the
+// message that asks for it.
+def repoRoot = rootProject.file("..")
+def hostFileToC = new File(repoRoot, "build-host-tools/file_to_c_host").absolutePath
+if (!new File(hostFileToC).exists()) {
+    throw new GradleException(
+        "Missing host-built file_to_c at ${hostFileToC}.\nBuild it once with:\n" +
+        "  c++ -std=c++17 -O2 -o build-host-tools/file_to_c_host " +
+        "lib/rt64/src/tools/file_to_c/file_to_c.cpp")
+}
+
+// Custom Vulkan driver loading (libadrenotools), off unless -PcustomDriver=true.
+// One switch deliberately drives two things, because either alone is broken:
+// the CMake option builds the loader and its hook libraries, and legacy jniLibs
+// packaging is what puts those hooks in nativeLibraryDir as real files.
+// libadrenotools REQUIRES the latter (see driver.h) -- without it the loader
+// returns a valid pointer and then silently falls back to the system driver.
+def customDriver = project.hasProperty('customDriver') &&
+        project.property('customDriver').toString().toBoolean()
+
+android {
+    namespace 'com.hybridheaven.recomp'
+    compileSdk 34
+
+    // Pin to the NDK the native build was validated against (M1-M3 direct build).
+    // Without this, AGP falls back to its bundled default (25.1), whose libc++
+    // headers don't transitively include <cmath> for RT64 (std::acos etc.).
+    ndkVersion '27.1.12297006'
+
+    defaultConfig {
+        applicationId "com.hybridheaven.recomp"
+        // API 28+: Bionic provides aligned_alloc (used by lib/SlotMap) only from
+        // level 28. Target handhelds (Retroid Pocket 5, AYN Thor) run Android 13.
+        minSdk 28
+        targetSdk 34
+        // Injected by the release workflow: -PvCode (semver-derived from the tag,
+        // major*10000+minor*100+patch) and -PvName (the tag with its leading v
+        // stripped). Falls back to a dev value for local/debug builds.
+        versionCode (project.hasProperty('vCode') ? project.property('vCode').toString().toInteger() : 1)
+        versionName (project.hasProperty('vName') ? project.property('vName').toString() : "1.0.0-dev")
+
+        // Native launcher-UI version string: same source as versionName, with any
+        // leading "v" from the git tag stripped (recomp::Version::from_string wants
+        // a bare major.minor.patch and rejects the leading "v").
+        def nativeVersion = (project.hasProperty('vName') ? project.property('vName').toString() : "1.0.0-dev").replaceFirst(/^v/, '')
+
+        ndk {
+            // arm64-v8a is the sole target for now (Retroid Pocket 5 / AYN Thor).
+            // x86_64 for the emulator can be added once the arm64 path is proven.
+            abiFilters 'arm64-v8a'
+        }
+
+        // The Java side has to agree with the native side about whether this build
+        // can load a custom driver: without the loader, the driver settings would
+        // offer a choice that silently does nothing, so the game hides that whole
+        // settings category unless the loader is compiled in.
+        buildConfigField "boolean", "CUSTOM_VULKAN_DRIVER", customDriver.toString()
+
+        externalNativeBuild {
+            cmake {
+                cppFlags "-std=c++20"
+                // Note: the NDK toolchain sets CMake's ANDROID variable itself,
+                // which is what CMakeLists.txt gates on — there is no
+                // HH_ANDROID define to pass.
+                arguments "-DANDROID_STL=c++_shared",
+                          "-DANDROID_PLATFORM=android-28",
+                          "-DHH_VERSION_STRING=${nativeVersion}",
+                          "-DRT64_FILE_TO_C=${hostFileToC}",
+                          "-DHH_CUSTOM_VULKAN_DRIVER=${customDriver ? 'ON' : 'OFF'}"
+            }
+        }
+    }
+
+    signingConfigs {
+        release {
+            if (keystorePropertiesFile.exists()) {
+                def rawPath = keystoreProperties['storeFile']
+                if (!rawPath) throw new GradleException("storeFile missing in keystore.properties")
+                if (keystorePropertiesFile.parentFile.name == 'android' && rawPath.startsWith('android/')) {
+                    rawPath = rawPath.substring('android/'.length())
+                }
+                File resolved = new File(rawPath)
+                if (!resolved.isAbsolute()) {
+                    File propRel = new File(keystorePropertiesFile.parentFile, rawPath)
+                    resolved = propRel.exists() ? propRel : new File(rootProject.projectDir, rawPath)
+                }
+                storeFile file(resolved)
+                storePassword keystoreProperties['storePassword']
+                keyAlias keystoreProperties['keyAlias']
+                keyPassword keystoreProperties['keyPassword']
+            }
+        }
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+            if (keystorePropertiesFile.exists()) {
+                signingConfig signingConfigs.release
+            }
+            ndk { debugSymbolLevel 'SYMBOL_TABLE' }
+        }
+        debug {
+            // Debug-signed APK for quick sideloading, but build the NATIVE code optimized.
+            // The NDK toolchain injects -O0 -g for a "Debug" CMAKE_BUILD_TYPE, and the software
+            // N64 recompiler + RT64 Vulkan renderer stutter badly at -O0. Force RelWithDebInfo
+            // (-O2 -g, keeps symbols) for the .so; the APK itself stays debuggable/debug-signed.
+            externalNativeBuild {
+                cmake {
+                    arguments "-DCMAKE_BUILD_TYPE=RelWithDebInfo"
+                }
+            }
+            ndk { debugSymbolLevel 'SYMBOL_TABLE' }
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_1_8
+        targetCompatibility JavaVersion.VERSION_1_8
+    }
+
+    // Only when -PcustomDriver=true: extract native libraries at install time so
+    // getApplicationInfo().nativeLibraryDir holds real files for libadrenotools'
+    // hook libraries. Left at AGP's default otherwise -- flipping it globally
+    // would change install footprint and .so load behaviour for every user to
+    // support a build nobody is running.
+    packaging {
+        jniLibs {
+            useLegacyPackaging = customDriver
+        }
+    }
+
+    externalNativeBuild {
+        cmake {
+            path file('../../CMakeLists.txt')
+            version '3.22.1'
+        }
+    }
+
+    // Game assets are packed into the APK and extracted to app-private storage on
+    // first launch (see AssetInstaller / native glue). Native code resolves them
+    // as <dataDir>/assets/<file> and <dataDir>/recompcontrollerdb.txt, so the APK
+    // asset tree must mirror that layout: assets/assets/... + recompcontrollerdb.txt.
+    sourceSets {
+        main {
+            assets.srcDirs = ["${buildDir}/hh-assets"]
+        }
+    }
+}
+
+// Stage the repo's assets/ dir and recompcontrollerdb.txt into the APK asset tree
+// with the layout the native runtime expects.
+def stageHybridHeavenAssets = tasks.register('stageHybridHeavenAssets', Copy) {
+    into "${buildDir}/hh-assets"
+    into('assets') {
+        from "${rootDir}/../assets"
+    }
+    from("${rootDir}/../recompcontrollerdb.txt")
+}
+tasks.named('preBuild').configure { dependsOn stageHybridHeavenAssets }
+
+dependencies {
+    implementation 'androidx.appcompat:appcompat:1.6.1'
+    implementation 'com.google.android.material:material:1.10.0'
+    implementation 'androidx.constraintlayout:constraintlayout:2.1.4'
+}

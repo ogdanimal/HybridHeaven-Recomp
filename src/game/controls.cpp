@@ -1,0 +1,209 @@
+#include <array>
+#include <cmath>
+
+#include "librecomp/helpers.hpp"
+#include "recomp_input.h"
+#include "hh_config.h"
+#include "ultramodern/ultramodern.hpp"
+
+// Arrays that hold the mappings for every input for keyboard and controller respectively.
+using input_mapping = std::array<recomp::InputField, recomp::bindings_per_input>;
+using input_mapping_array = std::array<input_mapping, static_cast<size_t>(recomp::GameInput::COUNT)>;
+static input_mapping_array keyboard_input_mappings{};
+static input_mapping_array controller_input_mappings{};
+
+// Make the button value array, which maps a button index to its bit field.
+#define DEFINE_INPUT(name, value, readable, description) uint16_t(value##u),
+static const std::array n64_button_values = {
+    DEFINE_N64_BUTTON_INPUTS()
+};
+#undef DEFINE_INPUT
+
+// Make the input name array.
+#define DEFINE_INPUT(name, value, readable, description) readable,
+static const std::vector<std::string> input_names = {
+    DEFINE_ALL_INPUTS()
+};
+#undef DEFINE_INPUT
+
+// Make the input enum name array.
+#define DEFINE_INPUT(name, value, readable, description) #name,
+static const std::vector<std::string> input_enum_names = {
+    DEFINE_ALL_INPUTS()
+};
+#undef DEFINE_INPUT
+
+#define DEFINE_INPUT(name, value, readable, description) description,
+static const std::vector<std::string> input_descriptions = {
+    DEFINE_ALL_INPUTS()
+};
+#undef DEFINE_INPUT
+
+size_t recomp::get_num_inputs() {
+    return (size_t)GameInput::COUNT;
+}
+
+const std::string& recomp::get_input_name(GameInput input) {
+    return input_names.at(static_cast<size_t>(input));
+}
+
+const std::string& recomp::get_input_enum_name(GameInput input) {
+    return input_enum_names.at(static_cast<size_t>(input));
+}
+
+const std::string& recomp::get_input_description(GameInput input) {
+    return input_descriptions.at(static_cast<size_t>(input));
+}
+
+recomp::GameInput recomp::get_input_from_enum_name(const std::string_view enum_name) {
+    auto find_it = std::find(input_enum_names.begin(), input_enum_names.end(), enum_name);
+    if (find_it == input_enum_names.end()) {
+        return recomp::GameInput::COUNT;
+    }
+
+    return static_cast<recomp::GameInput>(find_it - input_enum_names.begin());
+}
+
+// Due to an RmlUi limitation this can't be const. Ideally it would return a const reference or even just a straight up copy.
+recomp::InputField& recomp::get_input_binding(GameInput input, size_t binding_index, recomp::InputDevice device) {
+    input_mapping_array& device_mappings = (device == recomp::InputDevice::Controller) ?  controller_input_mappings : keyboard_input_mappings;
+    input_mapping& cur_input_mapping = device_mappings.at(static_cast<size_t>(input));
+
+    if (binding_index < cur_input_mapping.size()) {
+        return cur_input_mapping[binding_index];
+    }
+    else {
+        static recomp::InputField dummy_field = {};
+        return dummy_field;
+    }
+}
+
+void recomp::set_input_binding(recomp::GameInput input, size_t binding_index, recomp::InputDevice device, recomp::InputField value) {
+    input_mapping_array& device_mappings = (device == recomp::InputDevice::Controller) ?  controller_input_mappings : keyboard_input_mappings;
+    input_mapping& cur_input_mapping = device_mappings.at(static_cast<size_t>(input));
+
+    if (binding_index < cur_input_mapping.size()) {
+        cur_input_mapping[binding_index] = value;
+    }
+}
+
+bool recomp::get_n64_input(int controller_num, uint16_t* buttons_out, float* x_out, float* y_out) {
+    uint16_t cur_buttons = 0;
+    float cur_x = 0.0f;
+    float cur_y = 0.0f;
+
+    // Based on this code from ares: https://github.com/ares-emulator/ares/blob/6c8265577cec85392875760f913c70f4e193044e/ares/n64/controller/gamepad/gamepad.cpp#L232
+    constexpr double cardinal_max = 85.0;
+    constexpr double diagonal_max = 69.0;
+    constexpr double inner_deadzone = 7.0;
+    double outer_deadzone_radius_max = 2.0 / sqrt(2.0) * (diagonal_max / cardinal_max * (cardinal_max - inner_deadzone) + inner_deadzone);
+    
+    if (controller_num != 0) {
+        return false;
+    }
+
+    if (!recomp::game_input_disabled()) {
+        for (size_t i = 0; i < n64_button_values.size(); i++) {
+            size_t input_index = (size_t)GameInput::N64_BUTTON_START + i;
+            cur_buttons |= recomp::get_input_digital(keyboard_input_mappings[input_index]) ? n64_button_values[i] : 0;
+            cur_buttons |= recomp::get_input_digital(controller_input_mappings[input_index]) ? n64_button_values[i] : 0;
+        }
+
+        float joystick_x = recomp::get_input_analog(controller_input_mappings[(size_t)GameInput::X_AXIS_POS])
+                        - recomp::get_input_analog(controller_input_mappings[(size_t)GameInput::X_AXIS_NEG]);
+
+        float joystick_y = recomp::get_input_analog(controller_input_mappings[(size_t)GameInput::Y_AXIS_POS])
+                        - recomp::get_input_analog(controller_input_mappings[(size_t)GameInput::Y_AXIS_NEG]);
+
+        recomp::apply_joystick_deadzone(joystick_x, joystick_y, &joystick_x, &joystick_y);
+
+        cur_x = recomp::get_input_analog(keyboard_input_mappings[(size_t)GameInput::X_AXIS_POS])
+                - recomp::get_input_analog(keyboard_input_mappings[(size_t)GameInput::X_AXIS_NEG]) + joystick_x;
+
+        cur_y = recomp::get_input_analog(keyboard_input_mappings[(size_t)GameInput::Y_AXIS_POS])
+            - recomp::get_input_analog(keyboard_input_mappings[(size_t)GameInput::Y_AXIS_NEG]) + joystick_y;
+
+        cur_x *= outer_deadzone_radius_max;
+        cur_y *= outer_deadzone_radius_max;
+
+        double length = sqrt(cur_x * cur_x + cur_y * cur_y);
+        if (length <= outer_deadzone_radius_max) {
+            double length_absolute_x = abs(cur_x);
+            double length_absolute_y = abs(cur_y);
+
+            if (length_absolute_x <= inner_deadzone) {
+                length_absolute_x = 0.0;
+            }
+            else {
+                length_absolute_x = (length_absolute_x - inner_deadzone) * cardinal_max / (cardinal_max - inner_deadzone) / length_absolute_x;
+            }
+
+            cur_x *= length_absolute_x;
+
+            if (length_absolute_y <= inner_deadzone) {
+                length_absolute_y = 0.0;
+            }
+            else {
+                length_absolute_y = (length_absolute_y - inner_deadzone) * cardinal_max / (cardinal_max - inner_deadzone) / length_absolute_y;
+            }
+
+            cur_y *= length_absolute_y;
+        }
+        else {
+            length = outer_deadzone_radius_max / length;
+            cur_x *= length;
+            cur_y *= length;
+        }
+
+        if (cur_x != 0.0 && cur_y != 0.0) {
+            double slope = cur_y / cur_x;
+            double edge_x = copysign(cardinal_max / (abs(slope) + (cardinal_max - diagonal_max) / diagonal_max), cur_x);
+            double edge_y = copysign(MIN(abs(edge_x * slope), cardinal_max / (1.0 / abs(slope) + (cardinal_max - diagonal_max) / diagonal_max)), cur_y);
+
+            edge_x = edge_y / slope;
+            length = sqrt(cur_x * cur_x + cur_y * cur_y);
+
+            double distance_to_edge = sqrt(edge_x * edge_x + edge_y * edge_y);
+
+            if (length > distance_to_edge) {
+                cur_x = edge_x;
+                cur_y = edge_y;
+            }
+        }
+
+        cur_x = copysign(abs(cur_x) + 1e-09, cur_x);
+        cur_y = copysign(abs(cur_y) + 1e-09, cur_y);
+
+        cur_x /= 127.0f;
+        cur_y /= 127.0f;
+    }
+
+    // Goemon64Recomp post-processed the stick and button word here for its
+    // analog-camera mod: a left-stick counter-rotation, and masking a button out
+    // while the mod was on. This port needs no counter-rotation -- Hybrid Heaven
+    // rebuilds the movement basis from the camera every frame, so walking follows
+    // the view natively (see patches/camera.c). It does need the mask.
+    //
+    // C-DOWN is dropped while the analog camera is engaged. RB is bound to C-down
+    // by default and is also the camera's zoom modifier, so without this every
+    // zoom would also fire C-down -- which puts the player into the game's own
+    // close-look camera state, fighting the camera the player is driving. That
+    // state is exactly what the analog camera replaces, which is what makes
+    // C-down the right button to spend: unlike the right trigger, where the zoom
+    // modifier first went, nothing is lost. The trigger is N64 R, and R fires the
+    // gun.
+    //
+    // Bit looked up rather than written as 0x0004, so a change to the input table
+    // cannot silently mask the wrong button.
+    if (recomp::c_down_suppressed()) {
+        constexpr size_t c_down_index =
+            (size_t)GameInput::C_DOWN - (size_t)GameInput::N64_BUTTON_START;
+        cur_buttons &= ~n64_button_values[c_down_index];
+    }
+
+    *buttons_out = cur_buttons;
+    *x_out = std::clamp(cur_x, -1.0f, 1.0f);
+    *y_out = std::clamp(cur_y, -1.0f, 1.0f);
+
+    return true;
+}

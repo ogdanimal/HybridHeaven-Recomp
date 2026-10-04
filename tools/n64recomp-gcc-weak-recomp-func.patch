@@ -1,0 +1,18 @@
+diff --git a/include/recomp.h b/include/recomp.h
+index 73f3e73..caae6ba 100644
+--- a/include/recomp.h
++++ b/include/recomp.h
+@@ -27,7 +27,12 @@
+     // Use GCC's attribute for disabling inter-procedural optimizations. Also enable the rounding-math compiler flag to disable
+     // constant folding so that arithmetic respects the floating point environment. This is needed because gcc doesn't implement
+     // any FENV_ACCESS pragma.
+-    #define RECOMP_FUNC __attribute__((noipa, optimize("rounding-math")))
++    //
++    // Weak is required for the same reason the clang branch above uses it: a patched function is emitted both by the main
++    // recompilation and by the patch recompilation, and the override works by letting the linker pick the patch's definition.
++    // Without weak, GCC emits two strong definitions in two static archives, the linker binds every call to whichever archive
++    // it reaches first, and the patch is silently discarded -- a build that succeeds and runs with no patches applied at all.
++    #define RECOMP_FUNC __attribute__((weak, noipa, optimize("rounding-math")))
+ 
+     // There's no FENV_ACCESS pragma in gcc, so this can be empty.
+     #define SET_FENV_ACCESS()

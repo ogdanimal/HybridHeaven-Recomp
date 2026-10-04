@@ -1,0 +1,1273 @@
+#include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <mutex>
+
+#include "ultramodern/ultramodern.hpp"
+#include "recomp.h"
+#include "recomp_input.h"
+#include "hh_config.h"
+#include "recomp_ui.h"
+#include "hh_support.h"
+#include "SDL.h"
+#if defined(__ANDROID__)
+#include "SDL_syswm.h"
+#include "hh_render.h"
+#endif
+#include "promptfont.h"
+#include "GamepadMotion.hpp"
+
+constexpr float axis_threshold = 0.5f;
+
+struct ControllerState {
+    SDL_GameController* controller;
+    std::array<float, 3> latest_accelerometer;
+    GamepadMotion motion;
+    uint32_t prev_gyro_timestamp;
+    ControllerState() : controller{}, latest_accelerometer{}, motion{}, prev_gyro_timestamp{} {
+        motion.Reset();
+        motion.SetCalibrationMode(GamepadMotionHelpers::CalibrationMode::Stillness | GamepadMotionHelpers::CalibrationMode::SensorFusion);
+    };
+};
+
+static struct {
+    const Uint8* keys = nullptr;
+    SDL_Keymod keymod = SDL_Keymod::KMOD_NONE;
+    int numkeys = 0;
+    std::atomic_int32_t mouse_wheel_pos = 0;
+    std::mutex cur_controllers_mutex;
+    std::vector<SDL_GameController*> cur_controllers{};
+    std::unordered_map<SDL_JoystickID, ControllerState> controller_states;
+    
+    std::array<float, 2> rotation_delta{};
+    std::array<float, 2> mouse_delta{};
+    std::mutex pending_input_mutex;
+    std::array<float, 2> pending_rotation_delta{};
+    std::array<float, 2> pending_mouse_delta{};
+
+    float cur_rumble;
+    bool rumble_active;
+} InputState;
+
+static struct {
+    std::list<std::filesystem::path> files_dropped;
+} DropState;
+
+std::atomic<recomp::InputDevice> scanning_device = recomp::InputDevice::COUNT;
+std::atomic<recomp::InputField> scanned_input;
+
+enum class InputType {
+    None = 0, // Using zero for None ensures that default initialized InputFields are unbound.
+    Keyboard,
+    Mouse,
+    ControllerDigital,
+    ControllerAnalog // Axis input_id values are the SDL value + 1
+};
+
+void set_scanned_input(recomp::InputField value) {
+    scanning_device.store(recomp::InputDevice::COUNT);
+    scanned_input.store(value);
+}
+
+recomp::InputField recomp::get_scanned_input() {
+    recomp::InputField ret = scanned_input.load();
+    scanned_input.store({});
+    return ret;
+}
+
+void recomp::start_scanning_input(recomp::InputDevice device) {
+    scanned_input.store({});
+    scanning_device.store(device);
+}
+
+void recomp::stop_scanning_input() {
+    scanning_device.store(recomp::InputDevice::COUNT);
+}
+
+// Set on the SDL event thread when a scan is cancelled (menu-toggle / Escape
+// pressed mid-rebind); drained on the UI thread. The actual cancel touches RmlUi
+// data models (DirtyVariable), which must not run concurrently with the render
+// thread's Context::Update(), so it is deferred rather than done inline here.
+static std::atomic_bool scan_cancel_pending = false;
+
+void recomp::request_cancel_scanning_input() {
+    // Stop capturing immediately (atomic) so no further input is scanned in the
+    // window before the UI thread processes the cancel.
+    scanning_device.store(recomp::InputDevice::COUNT);
+    scan_cancel_pending.store(true);
+}
+
+bool recomp::poll_scan_cancel_requested() {
+    return scan_cancel_pending.exchange(false);
+}
+
+void queue_if_enabled(SDL_Event* event) {
+    if (!recomp::all_input_disabled()) {
+        recompui::queue_event(*event);
+    }
+}
+
+static std::atomic_bool cursor_enabled = true;
+
+void recompui::set_cursor_visible(bool visible) {
+    cursor_enabled.store(visible);
+}
+
+bool should_override_keystate(SDL_Scancode key, SDL_Keymod mod) {
+    // Override Enter when Alt is held.
+    if (key == SDL_Scancode::SDL_SCANCODE_RETURN) {
+        if (mod & SDL_Keymod::KMOD_ALT) {
+            return true;
+        }
+    }
+
+    return false;        
+}
+
+bool sdl_event_filter(void* userdata, SDL_Event* event) {
+    switch (event->type) {
+    case SDL_EventType::SDL_KEYDOWN:
+        {
+            SDL_KeyboardEvent* keyevent = &event->key;
+
+            // Skip repeated events when not in the menu
+            if (!recompui::is_context_capturing_input() &&
+                event->key.repeat) {
+                break;
+            }
+
+            if ((keyevent->keysym.scancode == SDL_Scancode::SDL_SCANCODE_RETURN && (keyevent->keysym.mod & SDL_Keymod::KMOD_ALT)) ||
+                keyevent->keysym.scancode == SDL_Scancode::SDL_SCANCODE_F11
+            ) {
+                recompui::toggle_fullscreen();
+            }
+            if (scanning_device != recomp::InputDevice::COUNT) {
+                if (keyevent->keysym.scancode == SDL_Scancode::SDL_SCANCODE_ESCAPE) {
+                    recomp::request_cancel_scanning_input();
+                } else if (scanning_device == recomp::InputDevice::Keyboard) {
+                    set_scanned_input({(uint32_t)InputType::Keyboard, keyevent->keysym.scancode});
+                }
+            } else {
+                if (!should_override_keystate(keyevent->keysym.scancode, static_cast<SDL_Keymod>(keyevent->keysym.mod))) {
+                    queue_if_enabled(event);
+                }
+            }
+        }
+        break;
+    case SDL_EventType::SDL_CONTROLLERDEVICEADDED:
+        {
+            SDL_ControllerDeviceEvent* controller_event = &event->cdevice;
+            SDL_GameController* controller = SDL_GameControllerOpen(controller_event->which);
+            // stderr rather than Goemon's stdout, here and below: runs on this
+            // project end with `timeout -k`, and stdout's block buffer goes with
+            // the process. These lines are the only evidence a pad ever connected.
+            fprintf(stderr, "[input] controller added: %d\n", controller_event->which);
+            if (controller == nullptr) {
+                // An index that will not open is worth a line of its own; the
+                // block below is silent about it and the pad simply never works.
+                fprintf(stderr, "[input] SDL_GameControllerOpen(%d) failed: %s\n",
+                    controller_event->which, SDL_GetError());
+            }
+            if (controller != nullptr) {
+                fprintf(stderr, "  Instance ID: %d\n", SDL_JoystickInstanceID(SDL_GameControllerGetJoystick(controller)));
+                // Name and GUID of every pad that connects. A controller whose
+                // buttons partly do nothing is almost always a missing or wrong
+                // entry in recompcontrollerdb.txt, and without the GUID a report
+                // of that costs a round trip -- the reporter cannot look it up
+                // and we cannot guess it (on Android it encodes a CRC of the
+                // device descriptor plus packed button/axis masks).
+                {
+                    SDL_Joystick* joystick = SDL_GameControllerGetJoystick(controller);
+                    char guid_str[33] = {};
+                    SDL_JoystickGetGUIDString(SDL_JoystickGetGUID(joystick), guid_str, sizeof(guid_str));
+                    const char* controller_name = SDL_GameControllerName(controller);
+                    fprintf(stderr, "  Name: %s\n", controller_name != nullptr ? controller_name : "(unknown)");
+                    fprintf(stderr, "  GUID: %s\n", guid_str);
+                    fprintf(stderr, "  Buttons/axes: %d/%d\n", SDL_JoystickNumButtons(joystick), SDL_JoystickNumAxes(joystick));
+                    // Which mapping SDL actually chose. A recompcontrollerdb.txt
+                    // entry whose GUID does not match is ignored SILENTLY and SDL
+                    // falls back to a built-in or auto-generated mapping, which
+                    // looks identical to the entry simply not working.
+                    char* mapping = SDL_GameControllerMapping(controller);
+                    if (mapping != nullptr) {
+                        fprintf(stderr, "  Mapping: %s\n", mapping);
+                        SDL_free(mapping);
+                    }
+                }
+                {
+                    // Same lock the guest thread holds to iterate controller_states in poll_inputs.
+                    std::lock_guard lock{ InputState.cur_controllers_mutex };
+                    ControllerState& state = InputState.controller_states[SDL_JoystickInstanceID(SDL_GameControllerGetJoystick(controller))];
+                    // If an entry for this instance id already holds a different
+                    // open handle, close it before overwriting -- otherwise the old
+                    // handle leaks (the H2 leak class). Purge it from the cached
+                    // vector first, as REMOVED does, so no reader iterates a freed
+                    // handle in the meantime.
+                    if (state.controller != nullptr && state.controller != controller) {
+                        auto& cc = InputState.cur_controllers;
+                        cc.erase(std::remove(cc.begin(), cc.end(), state.controller), cc.end());
+                        SDL_GameControllerClose(state.controller);
+                    }
+                    state.controller = controller;
+                }
+
+                if (SDL_GameControllerHasSensor(controller, SDL_SensorType::SDL_SENSOR_GYRO) && SDL_GameControllerHasSensor(controller, SDL_SensorType::SDL_SENSOR_ACCEL)) {
+                    SDL_GameControllerSetSensorEnabled(controller, SDL_SensorType::SDL_SENSOR_GYRO, SDL_TRUE);
+                    SDL_GameControllerSetSensorEnabled(controller, SDL_SensorType::SDL_SENSOR_ACCEL, SDL_TRUE);
+                }
+            }
+        }
+        break;
+    case SDL_EventType::SDL_CONTROLLERDEVICEREMOVED:
+        {
+            SDL_ControllerDeviceEvent* controller_event = &event->cdevice;
+            fprintf(stderr, "[input] controller removed: %d\n", controller_event->which);
+            std::lock_guard lock{ InputState.cur_controllers_mutex };
+            auto it = InputState.controller_states.find(controller_event->which);
+            if (it != InputState.controller_states.end()) {
+                if (it->second.controller != nullptr) {
+                    // Purge the raw pointer from the cached vector BEFORE closing
+                    // the handle. poll_inputs only rebuilds cur_controllers once a
+                    // frame, so without this the rumble/button/analog readers on
+                    // other threads would iterate a freed handle until the next
+                    // rebuild — a use-after-free. All those readers hold this same
+                    // mutex, so doing it here closes the window entirely.
+                    auto& cc = InputState.cur_controllers;
+                    cc.erase(std::remove(cc.begin(), cc.end(), it->second.controller), cc.end());
+                    // Close the handle before dropping the entry, or every
+                    // disconnect/reconnect (every sleep on a handheld) leaks one.
+                    SDL_GameControllerClose(it->second.controller);
+                }
+                InputState.controller_states.erase(it);
+            }
+        }
+        break;
+    case SDL_EventType::SDL_QUIT: {
+        if (!ultramodern::is_game_started()) {
+            ultramodern::quit();
+            return true;
+        }
+
+#if defined(__ANDROID__)
+        // On Android SDL_QUIT is delivered only by SDLActivity.onDestroy ->
+        // nativeSendQuit(), which then blocks the UI thread in an unbounded
+        // mSDLThread.join(). Opening the confirm prompt here would wedge the app:
+        // no thread is left to answer it, so the system eventually SIGKILLs us
+        // with no orderly save-thread join. The OS has already decided to destroy
+        // the activity, so there is nothing to confirm -- quit immediately (the
+        // same action the prompt's "Quit" button performs) and let game_main
+        // unwind and join the save thread cleanly.
+        ultramodern::quit();
+        return true;
+#else
+        hybridheaven::open_quit_game_prompt();
+        recompui::activate_mouse();
+        break;
+#endif
+    }
+    case SDL_EventType::SDL_MOUSEWHEEL:
+        {
+            SDL_MouseWheelEvent* wheel_event = &event->wheel;    
+            InputState.mouse_wheel_pos.fetch_add(wheel_event->y * (wheel_event->direction == SDL_MOUSEWHEEL_FLIPPED ? -1 : 1));
+        }
+        queue_if_enabled(event);
+        break;
+    case SDL_EventType::SDL_CONTROLLERBUTTONDOWN:
+        if (scanning_device != recomp::InputDevice::COUNT) {
+            auto menuToggleBinding0 = recomp::get_input_binding(recomp::GameInput::TOGGLE_MENU, 0, recomp::InputDevice::Controller);
+            auto menuToggleBinding1 = recomp::get_input_binding(recomp::GameInput::TOGGLE_MENU, 1, recomp::InputDevice::Controller);
+            // note - magic number: 0 is InputType::None
+            if ((menuToggleBinding0.input_type != 0 && event->cbutton.button == menuToggleBinding0.input_id) ||
+                (menuToggleBinding1.input_type != 0 && event->cbutton.button == menuToggleBinding1.input_id)) {
+                recomp::request_cancel_scanning_input();
+            } else if (scanning_device == recomp::InputDevice::Controller) {
+                SDL_ControllerButtonEvent* button_event = &event->cbutton;
+                auto scanned_input_index = recomp::get_scanned_input_index();
+                if ((scanned_input_index == static_cast<int>(recomp::GameInput::TOGGLE_MENU) ||
+                     scanned_input_index == static_cast<int>(recomp::GameInput::ACCEPT_MENU) ||
+                     scanned_input_index == static_cast<int>(recomp::GameInput::APPLY_MENU)) && (
+                     button_event->button == SDL_GameControllerButton::SDL_CONTROLLER_BUTTON_DPAD_UP ||
+                     button_event->button == SDL_GameControllerButton::SDL_CONTROLLER_BUTTON_DPAD_DOWN ||
+                     button_event->button == SDL_GameControllerButton::SDL_CONTROLLER_BUTTON_DPAD_LEFT ||
+                     button_event->button == SDL_GameControllerButton::SDL_CONTROLLER_BUTTON_DPAD_RIGHT)) {
+                    break;
+                }
+
+                set_scanned_input({(uint32_t)InputType::ControllerDigital, button_event->button});
+            }
+        } else {
+            queue_if_enabled(event);
+        }
+        break;
+    case SDL_EventType::SDL_CONTROLLERAXISMOTION:
+        if (scanning_device == recomp::InputDevice::Controller) {
+            auto scanned_input_index = recomp::get_scanned_input_index();
+            if (scanned_input_index == static_cast<int>(recomp::GameInput::TOGGLE_MENU) ||
+                scanned_input_index == static_cast<int>(recomp::GameInput::ACCEPT_MENU) ||
+                scanned_input_index == static_cast<int>(recomp::GameInput::APPLY_MENU)) {
+                break;
+            }
+
+            SDL_ControllerAxisEvent* axis_event = &event->caxis;
+            float axis_value = axis_event->value * (1/32768.0f);
+            if (axis_value > axis_threshold) {
+                SDL_Event set_stick_return_event;
+                set_stick_return_event.type = SDL_USEREVENT;
+                set_stick_return_event.user.code = axis_event->axis;
+                set_stick_return_event.user.data1 = nullptr;
+                set_stick_return_event.user.data2 = nullptr;
+                recompui::queue_event(set_stick_return_event);
+                
+                set_scanned_input({(uint32_t)InputType::ControllerAnalog, axis_event->axis + 1});
+            }
+            else if (axis_value < -axis_threshold) {
+                SDL_Event set_stick_return_event;
+                set_stick_return_event.type = SDL_USEREVENT;
+                set_stick_return_event.user.code = axis_event->axis;
+                set_stick_return_event.user.data1 = nullptr;
+                set_stick_return_event.user.data2 = nullptr;
+                recompui::queue_event(set_stick_return_event);
+
+                set_scanned_input({(uint32_t)InputType::ControllerAnalog, -axis_event->axis - 1});
+            }
+        } else {
+            queue_if_enabled(event);
+        }
+        break;
+    case SDL_EventType::SDL_CONTROLLERSENSORUPDATE:
+        if (event->csensor.sensor == SDL_SensorType::SDL_SENSOR_ACCEL) {
+            // Convert acceleration to g's.
+            float x = event->csensor.data[0] / SDL_STANDARD_GRAVITY;
+            float y = event->csensor.data[1] / SDL_STANDARD_GRAVITY;
+            float z = event->csensor.data[2] / SDL_STANDARD_GRAVITY;
+            std::lock_guard lock{ InputState.cur_controllers_mutex };
+            // find(), not operator[]: a sensor event that arrives after the
+            // controller's REMOVED would otherwise re-create a zombie entry
+            // (default handle null) that lingers in the map forever.
+            auto it = InputState.controller_states.find(event->csensor.which);
+            if (it != InputState.controller_states.end()) {
+                ControllerState& state = it->second;
+                state.latest_accelerometer[0] = x;
+                state.latest_accelerometer[1] = y;
+                state.latest_accelerometer[2] = z;
+            }
+        }
+        else if (event->csensor.sensor == SDL_SensorType::SDL_SENSOR_GYRO) {
+            // constexpr float gyro_threshold = 0.05f;
+            // Convert rotational velocity to degrees per second.
+            constexpr float rad_to_deg = 180.0f / M_PI;
+            float x = event->csensor.data[0] * rad_to_deg;
+            float y = event->csensor.data[1] * rad_to_deg;
+            float z = event->csensor.data[2] * rad_to_deg;
+
+            float rot_x = 0.0f;
+            float rot_y = 0.0f;
+            bool have_state = false;
+            {
+                // Held only around the controller_states access; released before
+                // taking pending_input_mutex below so the two never nest.
+                std::lock_guard lock{ InputState.cur_controllers_mutex };
+                // find(), not operator[]: see the accel branch -- a post-REMOVED
+                // sensor event must not resurrect a zombie entry.
+                auto it = InputState.controller_states.find(event->csensor.which);
+                if (it != InputState.controller_states.end()) {
+                    ControllerState& state = it->second;
+                    uint64_t cur_timestamp = event->csensor.timestamp;
+                    uint32_t delta_ms = cur_timestamp - state.prev_gyro_timestamp;
+                    state.motion.ProcessMotion(x, y, z, state.latest_accelerometer[0], state.latest_accelerometer[1], state.latest_accelerometer[2], delta_ms * 0.001f);
+                    state.prev_gyro_timestamp = cur_timestamp;
+                    state.motion.GetPlayerSpaceGyro(rot_x, rot_y);
+                    have_state = true;
+                }
+            }
+
+            if (have_state) {
+                std::lock_guard lock{ InputState.pending_input_mutex };
+                InputState.pending_rotation_delta[0] += rot_x;
+                InputState.pending_rotation_delta[1] += rot_y;
+            }
+        }
+        break;
+    case SDL_EventType::SDL_MOUSEMOTION:
+        if (!recomp::game_input_disabled()) {
+            SDL_MouseMotionEvent* motion_event = &event->motion;
+            std::lock_guard lock{ InputState.pending_input_mutex };
+            InputState.pending_mouse_delta[0] += motion_event->xrel;
+            InputState.pending_mouse_delta[1] += motion_event->yrel;
+        }
+        queue_if_enabled(event);
+        break;
+    case SDL_EventType::SDL_DROPBEGIN:
+        DropState.files_dropped.clear();
+        break;
+    case SDL_EventType::SDL_DROPFILE:
+        DropState.files_dropped.emplace_back(std::filesystem::path(std::u8string_view((const char8_t *)(event->drop.file))));
+        SDL_free(event->drop.file);
+        break;
+    case SDL_EventType::SDL_DROPCOMPLETE:
+        recompui::drop_files(DropState.files_dropped);
+        break;
+    case SDL_EventType::SDL_CONTROLLERBUTTONUP:
+        // Always queue button up events to avoid missing them during binding.
+        recompui::queue_event(*event);
+        break;
+#if defined(__ANDROID__)
+    // Android background/resume lifecycle. Pause the emulation on background so
+    // no threads run against the destroyed surface; resume it on foreground.
+    // WILLENTERBACKGROUND is delivered before SDL may block the main thread, so
+    // it's the reliable place to pause. (Surface recreation on resume is driven
+    // separately from the gfx thread; see rt64_render_context.)
+    case SDL_APP_WILLENTERBACKGROUND:
+        hybridheaven::diag::set_phase(hybridheaven::diag::Background);
+        ultramodern::set_app_paused(true);
+        queue_if_enabled(event);
+        break;
+    case SDL_APP_WILLENTERFOREGROUND:
+        hybridheaven::diag::set_phase(hybridheaven::diag::Resuming);
+        queue_if_enabled(event);
+        break;
+    case SDL_APP_DIDENTERFOREGROUND: {
+        hybridheaven::diag::set_phase(hybridheaven::diag::Foreground);
+        // Fetch the fresh ANativeWindow SDL created for the resumed surface and
+        // publish it for the gfx thread to rebuild the Vulkan surface. By
+        // DIDENTERFOREGROUND SDL has already run surfaceCreated/surfaceChanged,
+        // so wmInfo.info.android.window is the new, valid window.
+        //
+        // ID 1 is SDL's first-created window (RT64 uses the same idiom in
+        // rt64_application_window.cpp). This handler can't run before the game's
+        // single window exists, and the app never creates a second window. The
+        // null check below means a wrong/absent window just skips the publish:
+        // the surface stays stale (black) and recovers on the next resume, no deref.
+        SDL_Window* win = SDL_GetWindowFromID(1);
+        if (win != nullptr) {
+            SDL_SysWMinfo wmInfo;
+            SDL_VERSION(&wmInfo.version);
+            if (SDL_GetWindowWMInfo(win, &wmInfo) && wmInfo.info.android.window != nullptr) {
+                hybridheaven::renderer::android_publish_resume_window(wmInfo.info.android.window);
+            }
+        }
+        // Unpause only after publishing the new window, so the VI thread's first
+        // post-resume frame drives a present that rebuilds the surface.
+        ultramodern::set_app_paused(false);
+        queue_if_enabled(event);
+        break;
+    }
+#endif
+    default:
+        queue_if_enabled(event);
+        break;
+    }
+    return false;
+}
+
+void recomp::handle_events() {
+    SDL_Event cur_event;
+    static bool started = false;
+    static bool exited = false;
+    while (SDL_PollEvent(&cur_event) && !exited) {
+        exited = sdl_event_filter(nullptr, &cur_event);
+
+        // Lock the cursor if all three conditions are true: mouse aiming is enabled, game input is not disabled, and the game has been started. 
+        bool cursor_locked = (recomp::get_mouse_sensitivity() != 0) && !recomp::game_input_disabled() && ultramodern::is_game_started();
+
+        // Hide the cursor based on its enable state, but override visibility to false if the cursor is locked.
+        bool cursor_visible = cursor_enabled;
+        if (cursor_locked) {
+            cursor_visible = false;
+        }
+
+        SDL_ShowCursor(cursor_visible ? SDL_ENABLE : SDL_DISABLE);
+        SDL_SetRelativeMouseMode(cursor_locked ? SDL_TRUE : SDL_FALSE);
+    }
+
+    if (!started && ultramodern::is_game_started()) {
+        started = true;
+        recompui::process_game_started();
+    }
+}
+
+constexpr SDL_GameControllerButton SDL_CONTROLLER_BUTTON_SOUTH = SDL_CONTROLLER_BUTTON_A;
+constexpr SDL_GameControllerButton SDL_CONTROLLER_BUTTON_EAST = SDL_CONTROLLER_BUTTON_B;
+constexpr SDL_GameControllerButton SDL_CONTROLLER_BUTTON_WEST = SDL_CONTROLLER_BUTTON_X;
+constexpr SDL_GameControllerButton SDL_CONTROLLER_BUTTON_NORTH = SDL_CONTROLLER_BUTTON_Y;
+
+const recomp::DefaultN64Mappings recomp::default_n64_keyboard_mappings = {
+    .a = {
+        {.input_type = (uint32_t)InputType::Keyboard, .input_id = SDL_SCANCODE_SPACE}
+    },
+    .b = {
+        {.input_type = (uint32_t)InputType::Keyboard, .input_id = SDL_SCANCODE_LSHIFT}
+    },
+    .l = {
+        {.input_type = (uint32_t)InputType::Keyboard, .input_id = SDL_SCANCODE_E}
+    },
+    .r = {
+        {.input_type = (uint32_t)InputType::Keyboard, .input_id = SDL_SCANCODE_R}
+    },
+    .z = {
+        {.input_type = (uint32_t)InputType::Keyboard, .input_id = SDL_SCANCODE_Q}
+    },
+    .start = {
+        {.input_type = (uint32_t)InputType::Keyboard, .input_id = SDL_SCANCODE_RETURN}
+    },
+    .c_left = {
+        {.input_type = (uint32_t)InputType::Keyboard, .input_id = SDL_SCANCODE_LEFT}
+    },
+    .c_right = {
+        {.input_type = (uint32_t)InputType::Keyboard, .input_id = SDL_SCANCODE_RIGHT}
+    },
+    .c_up = {
+        {.input_type = (uint32_t)InputType::Keyboard, .input_id = SDL_SCANCODE_UP}
+    },
+    .c_down = {
+        {.input_type = (uint32_t)InputType::Keyboard, .input_id = SDL_SCANCODE_DOWN}
+    },
+    .dpad_left = {
+        {.input_type = (uint32_t)InputType::Keyboard, .input_id = SDL_SCANCODE_J}
+    },
+    .dpad_right = {
+        {.input_type = (uint32_t)InputType::Keyboard, .input_id = SDL_SCANCODE_L}
+    },
+    .dpad_up = {
+        {.input_type = (uint32_t)InputType::Keyboard, .input_id = SDL_SCANCODE_I}
+    },
+    .dpad_down = {
+        {.input_type = (uint32_t)InputType::Keyboard, .input_id = SDL_SCANCODE_K}
+    },
+    .analog_left = {
+        {.input_type = (uint32_t)InputType::Keyboard, .input_id = SDL_SCANCODE_A}
+    },
+    .analog_right = {
+        {.input_type = (uint32_t)InputType::Keyboard, .input_id = SDL_SCANCODE_D}
+    },
+    .analog_up = {
+        {.input_type = (uint32_t)InputType::Keyboard, .input_id = SDL_SCANCODE_W}
+    },
+    .analog_down = {
+        {.input_type = (uint32_t)InputType::Keyboard, .input_id = SDL_SCANCODE_S}
+    },
+    .toggle_menu = {
+        {.input_type = (uint32_t)InputType::Keyboard, .input_id = SDL_SCANCODE_ESCAPE}
+    },
+    .accept_menu = {
+        {.input_type = (uint32_t)InputType::Keyboard, .input_id = SDL_SCANCODE_RETURN}
+    },
+    .apply_menu = {
+        {.input_type = (uint32_t)InputType::Keyboard, .input_id = SDL_SCANCODE_F}
+    }
+};
+
+const recomp::DefaultN64Mappings recomp::default_n64_controller_mappings = {
+    // Goemon64Recomp's layout, kept because it covers every button Hybrid Heaven
+    // reads. Goemon authored it from a CSV in its own docs/, which this port does
+    // not have and should not be sent to look for.
+    //
+    // What the game actually reads, from its own disassembly
+    // (func_800021B4_2DB4 builds a 0x20-byte record per port at D_80089474):
+    //
+    //   +0x2  raw button word from osContGetReadData
+    //   +0x4  its newly-pressed edge
+    //   +0x6  stick X          +0x8  stick Y
+    //   +0xA  a direction word SYNTHESISED from the stick, at thresholds of
+    //         +0x29/-0x28 out of 84, reusing the N64 D-pad bit values
+    //   +0xC  its newly-pressed edge
+    //
+    // Every direction test in the game -- all 45 of them -- reads +0xC. Not one
+    // site reads a D-pad bit out of +0x2 or +0x4, so the hardware D-pad is dead
+    // input in this game and .dpad_* below can be left unbound for a reason that
+    // is Hybrid Heaven's rather than Goemon's. The buttons the game does read,
+    // from the same scan: A, B, Z, Start, L, R and all four C-buttons.
+    //
+    // The consequence for a modern pad is the part worth knowing: because
+    // directions come only from the stick, a physical D-pad bound to the N64
+    // D-pad would do nothing at all. It is bound to the C-buttons below instead.
+    //
+    // Face buttons use Xbox positional layout: A = SOUTH (bottom), B = EAST
+    // (right), X = WEST (left), Y = NORTH (top). SDL is told to report positions
+    // rather than printed labels -- the USE_BUTTON_LABELS hint in main().
+    .a = {
+        {.input_type = (uint32_t)InputType::ControllerDigital, .input_id = SDL_CONTROLLER_BUTTON_SOUTH},
+    },
+    .b = {
+        {.input_type = (uint32_t)InputType::ControllerDigital, .input_id = SDL_CONTROLLER_BUTTON_EAST},
+    },
+    .l = {
+        {.input_type = (uint32_t)InputType::ControllerDigital, .input_id = SDL_CONTROLLER_BUTTON_LEFTSHOULDER},
+    },
+    .r = {
+        {.input_type = (uint32_t)InputType::ControllerAnalog, .input_id = SDL_CONTROLLER_AXIS_TRIGGERRIGHT + 1},
+    },
+    .z = {
+        {.input_type = (uint32_t)InputType::ControllerAnalog, .input_id = SDL_CONTROLLER_AXIS_TRIGGERLEFT + 1},
+    },
+    .start = {
+        {.input_type = (uint32_t)InputType::ControllerDigital, .input_id = SDL_CONTROLLER_BUTTON_START},
+    },
+    // C-buttons carry three bindings each: a face/shoulder button, the right
+    // stick, and the D-pad. The right-stick binding is suppressed while the
+    // analog camera is driving, exactly as Goemon suppresses it for its own
+    // analog-camera mod: patches/camera.c renews
+    // recomp_set_right_analog_suppressed(1) on every step it drives, and
+    // acam_release() drops it back to (0). The renewal is deliberate -- the host
+    // side treats it as a short lease rather than a latch, so if that function
+    // ever stops being called the C-buttons come back on their own instead of
+    // staying dead. The face/shoulder button and the D-pad keep working
+    // throughout; only the stick changes hands. With the feature off, or in a
+    // camera mode it releases (see "Analog camera" in
+    // docs/development-notes.md), all three bindings are live.
+    .c_left = {
+        {.input_type = (uint32_t)InputType::ControllerDigital, .input_id = SDL_CONTROLLER_BUTTON_NORTH},
+        {.input_type = (uint32_t)InputType::ControllerAnalog, .input_id = -(SDL_CONTROLLER_AXIS_RIGHTX + 1)},
+        {.input_type = (uint32_t)InputType::ControllerDigital, .input_id = SDL_CONTROLLER_BUTTON_DPAD_LEFT},
+    },
+    .c_right = {
+        // No face button by design (A/B/X/Y are taken); stick + D-pad only.
+        {.input_type = (uint32_t)InputType::ControllerAnalog, .input_id = SDL_CONTROLLER_AXIS_RIGHTX + 1},
+        {.input_type = (uint32_t)InputType::ControllerDigital, .input_id = SDL_CONTROLLER_BUTTON_DPAD_RIGHT},
+    },
+    .c_up = {
+        {.input_type = (uint32_t)InputType::ControllerDigital, .input_id = SDL_CONTROLLER_BUTTON_WEST},
+        {.input_type = (uint32_t)InputType::ControllerAnalog, .input_id = -(SDL_CONTROLLER_AXIS_RIGHTY + 1)},
+        {.input_type = (uint32_t)InputType::ControllerDigital, .input_id = SDL_CONTROLLER_BUTTON_DPAD_UP},
+    },
+    .c_down = {
+        {.input_type = (uint32_t)InputType::ControllerDigital, .input_id = SDL_CONTROLLER_BUTTON_RIGHTSHOULDER},
+        {.input_type = (uint32_t)InputType::ControllerAnalog, .input_id = SDL_CONTROLLER_AXIS_RIGHTY + 1},
+        {.input_type = (uint32_t)InputType::ControllerDigital, .input_id = SDL_CONTROLLER_BUTTON_DPAD_DOWN},
+    },
+    // N64 D-pad intentionally unbound -- the physical D-pad drives the C-buttons
+    // above, and binding it here would be binding it to nothing: no site in the
+    // game reads a D-pad bit (see the scan described at the top of this table).
+    // The port's own menus are unaffected either way, since ui_state.cpp reads the
+    // physical D-pad straight from SDL.
+    .dpad_left = {},
+    .dpad_right = {},
+    .dpad_up = {},
+    .dpad_down = {},
+    .analog_left = {
+        {.input_type = (uint32_t)InputType::ControllerAnalog, .input_id = -(SDL_CONTROLLER_AXIS_LEFTX + 1)},
+    },
+    .analog_right = {
+        {.input_type = (uint32_t)InputType::ControllerAnalog, .input_id = SDL_CONTROLLER_AXIS_LEFTX + 1},
+    },
+    .analog_up = {
+        {.input_type = (uint32_t)InputType::ControllerAnalog, .input_id = -(SDL_CONTROLLER_AXIS_LEFTY + 1)},
+    },
+    .analog_down = {
+        {.input_type = (uint32_t)InputType::ControllerAnalog, .input_id = SDL_CONTROLLER_AXIS_LEFTY + 1},
+    },
+    .toggle_menu = {
+        {.input_type = (uint32_t)InputType::ControllerDigital, .input_id = SDL_CONTROLLER_BUTTON_BACK},
+    },
+    .accept_menu = {
+        {.input_type = (uint32_t)InputType::ControllerDigital, .input_id = SDL_CONTROLLER_BUTTON_SOUTH},
+    },
+    .apply_menu = {
+        {.input_type = (uint32_t)InputType::ControllerDigital, .input_id = SDL_CONTROLLER_BUTTON_WEST},
+        {.input_type = (uint32_t)InputType::ControllerDigital, .input_id = SDL_CONTROLLER_BUTTON_START}
+    }
+};
+
+void recomp::poll_inputs() {
+    InputState.keys = SDL_GetKeyboardState(&InputState.numkeys);
+    InputState.keymod = SDL_GetModState();
+
+    {
+        std::lock_guard lock{ InputState.cur_controllers_mutex };
+        InputState.cur_controllers.clear();
+
+        for (const auto& [id, state] : InputState.controller_states) {
+            (void)id; // Avoid unused variable warning.
+            SDL_GameController* controller = state.controller;
+            if (controller != nullptr) {
+                InputState.cur_controllers.push_back(controller);
+            }
+        }
+    }
+
+    // Read the deltas while resetting them to zero.
+    {
+        std::lock_guard lock{ InputState.pending_input_mutex };
+        
+        InputState.rotation_delta = InputState.pending_rotation_delta;
+        InputState.pending_rotation_delta = { 0.0f, 0.0f };
+
+        InputState.mouse_delta = InputState.pending_mouse_delta;
+        InputState.pending_mouse_delta = { 0.0f, 0.0f };
+    }
+    
+    // Quicksaving is disabled for now and will likely have more limited functionality
+    // when restored, rather than allowing saving and loading at any point in time.
+    #if 0
+    if (InputState.keys) {
+        static bool save_was_held = false;
+        static bool load_was_held = false;
+        bool save_is_held = InputState.keys[SDL_SCANCODE_F5] != 0;
+        bool load_is_held = InputState.keys[SDL_SCANCODE_F7] != 0;
+        if (save_is_held && !save_was_held) {
+            hybridheaven::quicksave_save();
+        }
+        else if (load_is_held && !load_was_held) {
+            hybridheaven::quicksave_load();
+        }
+        save_was_held = save_is_held;
+    }
+    #endif
+}
+
+void recomp::set_rumble(int controller_num, bool on) {
+    if (controller_num == 0) {
+        InputState.rumble_active = on;
+    }
+}
+
+ultramodern::input::connected_device_info_t recomp::get_connected_device_info(int controller_num) {
+    switch (controller_num) {
+        case 0:
+            return ultramodern::input::connected_device_info_t {
+                .connected_device = ultramodern::input::Device::Controller,
+                .connected_pak = ultramodern::input::Pak::RumblePak,
+            };
+    }
+
+    return ultramodern::input::connected_device_info_t {
+        .connected_device = ultramodern::input::Device::None,
+        .connected_pak = ultramodern::input::Pak::None,
+    };
+}
+
+static float smoothstep(float from, float to, float amount) {
+    amount = (amount * amount) * (3.0f - 2.0f * amount);
+    return std::lerp(from, to, amount);
+}
+
+// Update rumble to attempt to mimic the way n64 rumble ramps up and falls off
+void recomp::update_rumble() {
+    // Note: values are not accurate! just approximations based on feel
+    if (InputState.rumble_active) {
+        InputState.cur_rumble += 0.17f;
+        if (InputState.cur_rumble > 1) InputState.cur_rumble = 1;
+    } else {
+        InputState.cur_rumble *= 0.92f;
+        InputState.cur_rumble -= 0.01f;
+        if (InputState.cur_rumble < 0) InputState.cur_rumble = 0;
+    }
+    float smooth_rumble = smoothstep(0, 1, InputState.cur_rumble);
+
+    uint16_t rumble_strength = smooth_rumble * (recomp::get_rumble_strength() * 0xFFFF / 100);
+    uint32_t duration = 1000000; // Dummy duration value that lasts long enough to matter as the game will reset rumble on its own.
+    {
+        std::lock_guard lock{ InputState.cur_controllers_mutex };
+        for (const auto& controller : InputState.cur_controllers) {
+            SDL_GameControllerRumble(controller, 0, rumble_strength, duration);
+        }
+    }
+}
+
+bool controller_button_state(int32_t input_id) {
+    if (input_id >= 0 && input_id < SDL_GameControllerButton::SDL_CONTROLLER_BUTTON_MAX) {
+        SDL_GameControllerButton button = (SDL_GameControllerButton)input_id;
+        bool ret = false;
+        {
+            std::lock_guard lock{ InputState.cur_controllers_mutex };
+            for (const auto& controller : InputState.cur_controllers) {
+                ret |= SDL_GameControllerGetButton(controller, button);
+            }
+        }
+
+        return ret;
+    }
+    return false;
+}
+
+// Right-stick suppression, as a lease rather than a latch.
+//
+// The analog camera arms this from inside a game function that only runs while
+// the gameplay overlay is resident. A plain flag would therefore stay set for
+// good the moment the game leaves that overlay with the camera engaged -- a
+// cutscene, a menu, a mode switch -- and the right stick would silently stop
+// working as the C-buttons with nothing left running to clear it.
+//
+// So arming expires. The patch re-arms on every step, roughly thirty times a
+// frame, so the lease is renewed every ~16 ms and a window an order of magnitude
+// wider than that cannot flicker; when the patch stops running for any reason at
+// all, the C-buttons come back on their own within a quarter second.
+static std::atomic<std::chrono::steady_clock::time_point> right_analog_suppressed_until{};
+
+static constexpr auto right_analog_suppression_lease = std::chrono::milliseconds(250);
+
+static bool right_analog_suppressed() {
+    return std::chrono::steady_clock::now() < right_analog_suppressed_until.load(std::memory_order_relaxed);
+}
+
+// The same lease, for N64 C-DOWN, armed separately and claimed later.
+//
+// The right stick stops being the C-buttons as soon as the analog camera is
+// switched on -- the D-Pad covers them, and it avoids a stray C press the first
+// time you push the stick. C-down is only claimed once the camera is actually
+// ENGAGED, so nothing changes for a player who leaves the setting on and never
+// touches the right stick.
+//
+// Why C-down and not the right trigger, which is where the zoom modifier first
+// went: the trigger is N64 R, and R fires the gun. Masking it cost a weapon.
+// C-down is bound to RB by default and its in-game job is the game's own
+// close-look camera -- the thing this feature replaces -- so it is the one
+// button whose loss costs nothing while the analog camera is driving.
+static std::atomic<std::chrono::steady_clock::time_point> c_down_suppressed_until{};
+
+bool recomp::c_down_suppressed() {
+    return std::chrono::steady_clock::now() < c_down_suppressed_until.load(std::memory_order_relaxed);
+}
+
+float controller_axis_state(int32_t input_id, bool allow_suppression) {
+    // 64-bit abs: input_id comes from controls.json, so a hand-edited INT32_MIN
+    // would make abs(int) UB. The lower bound also rejects input_id 0 (-> axis
+    // -1 into SDL) which a corrupt file could otherwise produce.
+    int64_t axis_index = std::abs(static_cast<int64_t>(input_id)) - 1;
+    if (axis_index >= 0 && axis_index < SDL_GameControllerAxis::SDL_CONTROLLER_AXIS_MAX) {
+        SDL_GameControllerAxis axis = (SDL_GameControllerAxis)axis_index;
+        bool negative_range = input_id < 0;
+        float ret = 0.0f;
+
+        {
+            std::lock_guard lock{ InputState.cur_controllers_mutex };
+            for (const auto& controller : InputState.cur_controllers) {
+                float cur_val = SDL_GameControllerGetAxis(controller, axis) * (1/32768.0f);
+                if (negative_range) {
+                    cur_val = -cur_val;
+                }
+
+                // Check if this input is a right analog axis and suppress it accordingly.
+                if (allow_suppression && right_analog_suppressed() &&
+                    (axis == SDL_GameControllerAxis::SDL_CONTROLLER_AXIS_RIGHTX || axis == SDL_GameControllerAxis::SDL_CONTROLLER_AXIS_RIGHTY)) {
+                    cur_val = 0;
+                }
+                ret += std::clamp(cur_val, 0.0f, 1.0f);
+            }
+        }
+
+        return std::clamp(ret, 0.0f, 1.0f);
+    }
+    return false;
+}
+
+float recomp::get_input_analog(const recomp::InputField& field) {
+    switch ((InputType)field.input_type) {
+    case InputType::Keyboard:
+        if (InputState.keys && field.input_id >= 0 && field.input_id < InputState.numkeys) {
+            if (should_override_keystate(static_cast<SDL_Scancode>(field.input_id), InputState.keymod)) {
+                return 0.0f;
+            }
+            return InputState.keys[field.input_id] ? 1.0f : 0.0f;
+        }
+        return 0.0f;
+    case InputType::ControllerDigital:
+        return controller_button_state(field.input_id) ? 1.0f : 0.0f;
+    case InputType::ControllerAnalog:
+        return controller_axis_state(field.input_id, true);
+    case InputType::Mouse:
+        // TODO mouse support
+        return 0.0f;
+    case InputType::None:
+        return false;
+    }
+    // input_type is a raw uint32_t from controls.json; an out-of-range value
+    // (hand-edited config) matches no case and would otherwise fall off the end
+    // of this non-void function (UB). Treat anything unknown as unbound.
+    return 0.0f;
+}
+
+float recomp::get_input_analog(const std::span<const recomp::InputField> fields) {
+    float ret = 0.0f;
+    for (const auto& field : fields) {
+        ret += get_input_analog(field);
+    }
+    return std::clamp(ret, 0.0f, 1.0f);
+}
+
+bool recomp::get_input_digital(const recomp::InputField& field) {
+    switch ((InputType)field.input_type) {
+    case InputType::Keyboard:
+        if (InputState.keys && field.input_id >= 0 && field.input_id < InputState.numkeys) {
+            if (should_override_keystate(static_cast<SDL_Scancode>(field.input_id), InputState.keymod)) {
+                return false;
+            }
+            return InputState.keys[field.input_id] != 0;
+        }
+        return false;
+    case InputType::ControllerDigital:
+        return controller_button_state(field.input_id);
+    case InputType::ControllerAnalog:
+        // TODO adjustable threshold
+        return controller_axis_state(field.input_id, true) >= axis_threshold;
+    case InputType::Mouse:
+        // TODO mouse support
+        return false;
+    case InputType::None:
+        return false;
+    }
+    // Out-of-range input_type from a hand-edited controls.json matches no case;
+    // return unbound rather than falling off the end (UB).
+    return false;
+}
+
+bool recomp::get_input_digital(const std::span<const recomp::InputField> fields) {
+    bool ret = 0;
+    for (const auto& field : fields) {
+        ret |= get_input_digital(field);
+    }
+    return ret;
+}
+
+void recomp::get_gyro_deltas(float* x, float* y) {
+    std::array<float, 2> cur_rotation_delta = InputState.rotation_delta;
+    float sensitivity = (float)recomp::get_gyro_sensitivity() / 100.0f;
+    *x = cur_rotation_delta[0] * sensitivity;
+    *y = cur_rotation_delta[1] * sensitivity;
+}
+
+void recomp::get_mouse_deltas(float* x, float* y) {
+    std::array<float, 2> cur_mouse_delta = InputState.mouse_delta;
+    float sensitivity = (float)recomp::get_mouse_sensitivity() / 100.0f;
+    *x = cur_mouse_delta[0] * sensitivity;
+    *y = cur_mouse_delta[1] * sensitivity;
+}
+
+void recomp::apply_joystick_deadzone(float x_in, float y_in, float* x_out, float* y_out) {
+    float joystick_deadzone = (float)recomp::get_joystick_deadzone() / 100.0f;
+
+    // A 100% deadzone means nothing registers, and the (1 - deadzone) rescale
+    // below would divide by zero for a fully-deflected axis (NaN). The setter
+    // clamps deadzone to [0,100]; guard the degenerate endpoint here too.
+    if (joystick_deadzone >= 1.0f) {
+        *x_out = 0.0f;
+        *y_out = 0.0f;
+        return;
+    }
+
+    if(fabsf(x_in) < joystick_deadzone) {
+        x_in = 0.0f;
+    }
+    else {
+        if(x_in > 0.0f) {
+            x_in -= joystick_deadzone;
+        } 
+        else {
+            x_in += joystick_deadzone;
+        }
+
+        x_in /= (1.0f - joystick_deadzone);
+    }
+
+    if(fabsf(y_in) < joystick_deadzone) {
+        y_in = 0.0f;
+    }
+    else {
+        if(y_in > 0.0f) {
+            y_in -= joystick_deadzone;
+        } 
+        else {
+            y_in += joystick_deadzone;
+        }
+
+        y_in /= (1.0f - joystick_deadzone);
+    }
+
+    *x_out = x_in;
+    *y_out = y_in;
+}
+
+// Read the right analog stick, summed across connected controllers.
+//
+// Prefer the SDL GameController axis mapping (correct on desktop and any device
+// with a proper mapping). Some Android handhelds (e.g. the Retroid Pocket 5)
+// present their pad as a raw joystick with NO GameController axis mapping, so
+// SDL_GameControllerGetAxis returns 0 for every axis. In that case fall back to
+// the underlying joystick's raw axes, which follow the SDL enum order:
+//   0=LeftX 1=LeftY 2=RightX 3=RightY 4=TriggerLeft 5=TriggerRight
+void recomp::get_right_analog(float* x, float* y) {
+    constexpr float k = 1.0f / 32768.0f;
+    float x_val = 0.0f;
+    float y_val = 0.0f;
+
+    {
+        std::lock_guard lock{ InputState.cur_controllers_mutex };
+        for (const auto& controller : InputState.cur_controllers) {
+            float gx = SDL_GameControllerGetAxis(controller, SDL_CONTROLLER_AXIS_RIGHTX) * k;
+            float gy = SDL_GameControllerGetAxis(controller, SDL_CONTROLLER_AXIS_RIGHTY) * k;
+
+            // Fall back to raw joystick axes when the GameController mapping has
+            // no usable binding for the right stick. "Exactly 0" is not enough:
+            // the mapping can half-initialize between sessions and return tiny
+            // drift on wrongly-mapped axes, which silently starves the fallback.
+            // Treat anything under ~10% deflection as "mapping dead" and prefer
+            // the raw axes if they show more movement.
+            if (gx * gx + gy * gy < 0.01f) {
+                SDL_Joystick* js = SDL_GameControllerGetJoystick(controller);
+                if (js != nullptr && SDL_JoystickNumAxes(js) >= 4) {
+                    float rx = SDL_JoystickGetAxis(js, 2) * k;
+                    float ry = SDL_JoystickGetAxis(js, 3) * k;
+                    if (rx * rx + ry * ry > gx * gx + gy * gy) {
+                        gx = rx;
+                        gy = ry;
+                    }
+                }
+            }
+
+            x_val += std::clamp(gx, -1.0f, 1.0f);
+            y_val += std::clamp(gy, -1.0f, 1.0f);
+        }
+    }
+
+    x_val = std::clamp(x_val, -1.0f, 1.0f);
+    y_val = std::clamp(y_val, -1.0f, 1.0f);
+
+    recomp::apply_joystick_deadzone(x_val, y_val, x, y);
+}
+
+// R3 (right-stick click) — the analog camera's "give the camera back to the
+// game" recenter button. Returns the raw held state; the patch edge-detects it
+// (update_analog_camera can run several times per rendered frame, so a
+// level read is the safe thing to expose).
+//
+// Same mapping caveat as get_right_analog: on handhelds that present as a raw
+// joystick with no GameController mapping, SDL_GameControllerGetButton returns
+// 0, so fall back to the raw joystick button in SDL enum order
+// (7 = LeftStick, 8 = RightStick).
+bool recomp::get_camera_recenter_pressed() {
+    std::lock_guard lock{ InputState.cur_controllers_mutex };
+    for (const auto& controller : InputState.cur_controllers) {
+        if (SDL_GameControllerGetButton(controller, SDL_CONTROLLER_BUTTON_RIGHTSTICK)) {
+            return true;
+        }
+        SDL_Joystick* js = SDL_GameControllerGetJoystick(controller);
+        if (js != nullptr && SDL_JoystickNumButtons(js) > 8 &&
+            SDL_JoystickGetButton(js, 8)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Analog-camera zoom modifier: the physical RIGHT SHOULDER button (RB).
+//
+// Read straight from the pad rather than through the N64 C-down binding it
+// shares, because that binding is masked while the camera is engaged -- going
+// through it would read the mask instead of the button.
+//
+// It was the right trigger first, and that was wrong: the trigger is N64 R and R
+// fires the gun, so the mask that stopped zooming from also pressing R cost a
+// weapon. RB's N64 meaning is C-down, whose in-game job is the game's own
+// close-look camera, which is precisely what this replaces.
+//
+// Same raw-joystick fallback as get_camera_recenter_pressed, for handhelds with
+// no GameController mapping: SDL enum order puts RightShoulder at button 10.
+bool recomp::get_camera_zoom_held() {
+    std::lock_guard lock{ InputState.cur_controllers_mutex };
+    for (const auto& controller : InputState.cur_controllers) {
+        if (SDL_GameControllerGetButton(controller, SDL_CONTROLLER_BUTTON_RIGHTSHOULDER)) {
+            return true;
+        }
+        SDL_Joystick* js = SDL_GameControllerGetJoystick(controller);
+        if (js != nullptr && SDL_JoystickNumButtons(js) > 10 &&
+            SDL_JoystickGetButton(js, 10)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Arms or drops the right-stick suppression lease. `true` renews it for
+// right_analog_suppression_lease; `false` ends it immediately rather than
+// waiting the lease out, so releasing the camera gives the C-buttons back at
+// once. See the declaration for why this expires at all.
+void recomp::set_c_down_suppressed(bool suppressed) {
+    c_down_suppressed_until.store(
+        suppressed ? std::chrono::steady_clock::now() + right_analog_suppression_lease
+                   : std::chrono::steady_clock::time_point{},
+        std::memory_order_relaxed);
+}
+
+void recomp::set_right_analog_suppressed(bool suppressed) {
+    right_analog_suppressed_until.store(
+        suppressed ? std::chrono::steady_clock::now() + right_analog_suppression_lease
+                   : std::chrono::steady_clock::time_point{},
+        std::memory_order_relaxed);
+}
+
+bool recomp::game_input_disabled() {
+    // Disable input if any menu that blocks input is open.
+    return recompui::is_context_capturing_input();
+}
+
+bool recomp::all_input_disabled() {
+    // Disable all input if an input is being polled.
+    return scanning_device != recomp::InputDevice::COUNT;
+}
+
+std::string controller_button_to_string(SDL_GameControllerButton button) {
+    switch (button) {
+    case SDL_GameControllerButton::SDL_CONTROLLER_BUTTON_A:
+        return PF_GAMEPAD_A;
+    case SDL_GameControllerButton::SDL_CONTROLLER_BUTTON_B:
+        return PF_GAMEPAD_B;
+    case SDL_GameControllerButton::SDL_CONTROLLER_BUTTON_X:
+        return PF_GAMEPAD_X;
+    case SDL_GameControllerButton::SDL_CONTROLLER_BUTTON_Y:
+        return PF_GAMEPAD_Y;
+    case SDL_GameControllerButton::SDL_CONTROLLER_BUTTON_BACK:
+        return PF_XBOX_VIEW;
+    case SDL_GameControllerButton::SDL_CONTROLLER_BUTTON_GUIDE:
+        return PF_GAMEPAD_HOME;
+    case SDL_GameControllerButton::SDL_CONTROLLER_BUTTON_START:
+        return PF_XBOX_MENU;
+    case SDL_GameControllerButton::SDL_CONTROLLER_BUTTON_LEFTSTICK:
+        return PF_ANALOG_L_CLICK;
+    case SDL_GameControllerButton::SDL_CONTROLLER_BUTTON_RIGHTSTICK:
+        return PF_ANALOG_R_CLICK;
+    case SDL_GameControllerButton::SDL_CONTROLLER_BUTTON_LEFTSHOULDER:
+        return PF_XBOX_LEFT_SHOULDER;
+    case SDL_GameControllerButton::SDL_CONTROLLER_BUTTON_RIGHTSHOULDER:
+        return PF_XBOX_RIGHT_SHOULDER;
+    case SDL_GameControllerButton::SDL_CONTROLLER_BUTTON_DPAD_UP:
+        return PF_DPAD_UP;
+    case SDL_GameControllerButton::SDL_CONTROLLER_BUTTON_DPAD_DOWN:
+        return PF_DPAD_DOWN;
+    case SDL_GameControllerButton::SDL_CONTROLLER_BUTTON_DPAD_LEFT:
+        return PF_DPAD_LEFT;
+    case SDL_GameControllerButton::SDL_CONTROLLER_BUTTON_DPAD_RIGHT:
+        return PF_DPAD_RIGHT;
+    // case SDL_GameControllerButton::SDL_CONTROLLER_BUTTON_MISC1:
+    //     return "";
+    // case SDL_GameControllerButton::SDL_CONTROLLER_BUTTON_PADDLE1:
+    //     return "";
+    // case SDL_GameControllerButton::SDL_CONTROLLER_BUTTON_PADDLE2:
+    //     return "";
+    // case SDL_GameControllerButton::SDL_CONTROLLER_BUTTON_PADDLE3:
+    //     return "";
+    // case SDL_GameControllerButton::SDL_CONTROLLER_BUTTON_PADDLE4:
+    //     return "";
+    case SDL_GameControllerButton::SDL_CONTROLLER_BUTTON_TOUCHPAD:
+        return PF_SONY_TOUCHPAD;
+    default:
+        return "Button " + std::to_string(button);
+    }
+}
+
+std::unordered_map<SDL_Scancode, std::string> scancode_codepoints {
+    {SDL_SCANCODE_LEFT, PF_KEYBOARD_LEFT},
+    // NOTE: UP and RIGHT are swapped with promptfont.
+    {SDL_SCANCODE_UP, PF_KEYBOARD_RIGHT},
+    {SDL_SCANCODE_RIGHT, PF_KEYBOARD_UP},
+    {SDL_SCANCODE_DOWN, PF_KEYBOARD_DOWN},
+    {SDL_SCANCODE_A, PF_KEYBOARD_A},
+    {SDL_SCANCODE_B, PF_KEYBOARD_B},
+    {SDL_SCANCODE_C, PF_KEYBOARD_C},
+    {SDL_SCANCODE_D, PF_KEYBOARD_D},
+    {SDL_SCANCODE_E, PF_KEYBOARD_E},
+    {SDL_SCANCODE_F, PF_KEYBOARD_F},
+    {SDL_SCANCODE_G, PF_KEYBOARD_G},
+    {SDL_SCANCODE_H, PF_KEYBOARD_H},
+    {SDL_SCANCODE_I, PF_KEYBOARD_I},
+    {SDL_SCANCODE_J, PF_KEYBOARD_J},
+    {SDL_SCANCODE_K, PF_KEYBOARD_K},
+    {SDL_SCANCODE_L, PF_KEYBOARD_L},
+    {SDL_SCANCODE_M, PF_KEYBOARD_M},
+    {SDL_SCANCODE_N, PF_KEYBOARD_N},
+    {SDL_SCANCODE_O, PF_KEYBOARD_O},
+    {SDL_SCANCODE_P, PF_KEYBOARD_P},
+    {SDL_SCANCODE_Q, PF_KEYBOARD_Q},
+    {SDL_SCANCODE_R, PF_KEYBOARD_R},
+    {SDL_SCANCODE_S, PF_KEYBOARD_S},
+    {SDL_SCANCODE_T, PF_KEYBOARD_T},
+    {SDL_SCANCODE_U, PF_KEYBOARD_U},
+    {SDL_SCANCODE_V, PF_KEYBOARD_V},
+    {SDL_SCANCODE_W, PF_KEYBOARD_W},
+    {SDL_SCANCODE_X, PF_KEYBOARD_X},
+    {SDL_SCANCODE_Y, PF_KEYBOARD_Y},
+    {SDL_SCANCODE_Z, PF_KEYBOARD_Z},
+    {SDL_SCANCODE_0, PF_KEYBOARD_0},
+    {SDL_SCANCODE_1, PF_KEYBOARD_1},
+    {SDL_SCANCODE_2, PF_KEYBOARD_2},
+    {SDL_SCANCODE_3, PF_KEYBOARD_3},
+    {SDL_SCANCODE_4, PF_KEYBOARD_4},
+    {SDL_SCANCODE_5, PF_KEYBOARD_5},
+    {SDL_SCANCODE_6, PF_KEYBOARD_6},
+    {SDL_SCANCODE_7, PF_KEYBOARD_7},
+    {SDL_SCANCODE_8, PF_KEYBOARD_8},
+    {SDL_SCANCODE_9, PF_KEYBOARD_9},
+    {SDL_SCANCODE_ESCAPE, PF_KEYBOARD_ESCAPE},
+    {SDL_SCANCODE_F1, PF_KEYBOARD_F1},
+    {SDL_SCANCODE_F2, PF_KEYBOARD_F2},
+    {SDL_SCANCODE_F3, PF_KEYBOARD_F3},
+    {SDL_SCANCODE_F4, PF_KEYBOARD_F4},
+    {SDL_SCANCODE_F5, PF_KEYBOARD_F5},
+    {SDL_SCANCODE_F6, PF_KEYBOARD_F6},
+    {SDL_SCANCODE_F7, PF_KEYBOARD_F7},
+    {SDL_SCANCODE_F8, PF_KEYBOARD_F8},
+    {SDL_SCANCODE_F9, PF_KEYBOARD_F9},
+    {SDL_SCANCODE_F10, PF_KEYBOARD_F10},
+    {SDL_SCANCODE_F11, PF_KEYBOARD_F11},
+    {SDL_SCANCODE_F12, PF_KEYBOARD_F12},
+    {SDL_SCANCODE_PRINTSCREEN, PF_KEYBOARD_PRINT_SCREEN},
+    {SDL_SCANCODE_SCROLLLOCK, PF_KEYBOARD_SCROLL_LOCK},
+    {SDL_SCANCODE_PAUSE, PF_KEYBOARD_PAUSE},
+    {SDL_SCANCODE_INSERT, PF_KEYBOARD_INSERT},
+    {SDL_SCANCODE_HOME, PF_KEYBOARD_HOME},
+    {SDL_SCANCODE_PAGEUP, PF_KEYBOARD_PAGE_UP},
+    {SDL_SCANCODE_DELETE, PF_KEYBOARD_DELETE},
+    {SDL_SCANCODE_END, PF_KEYBOARD_END},
+    {SDL_SCANCODE_PAGEDOWN, PF_KEYBOARD_PAGE_DOWN},
+    {SDL_SCANCODE_SPACE, PF_KEYBOARD_SPACE},
+    {SDL_SCANCODE_BACKSPACE, PF_KEYBOARD_BACKSPACE},
+    {SDL_SCANCODE_TAB, PF_KEYBOARD_TAB},
+    {SDL_SCANCODE_RETURN, PF_KEYBOARD_ENTER},
+    {SDL_SCANCODE_CAPSLOCK, PF_KEYBOARD_CAPS},
+    {SDL_SCANCODE_NUMLOCKCLEAR, PF_KEYBOARD_NUM_LOCK},
+    {SDL_SCANCODE_LSHIFT, "L" PF_KEYBOARD_SHIFT},
+    {SDL_SCANCODE_RSHIFT, "R" PF_KEYBOARD_SHIFT},
+};
+
+std::string keyboard_input_to_string(SDL_Scancode key) {
+    if (scancode_codepoints.find(key) != scancode_codepoints.end()) {
+        return scancode_codepoints[key];
+    }
+    return std::to_string(key);
+}
+
+std::string controller_axis_to_string(int axis) {
+    bool positive = axis > 0;
+    // 64-bit abs to avoid abs(INT_MIN) UB on a hand-edited controls.json id.
+    SDL_GameControllerAxis actual_axis = SDL_GameControllerAxis(std::abs(static_cast<int64_t>(axis)) - 1);
+    switch (actual_axis) {
+    case SDL_GameControllerAxis::SDL_CONTROLLER_AXIS_LEFTX:
+        return positive ? "\u21C0" : "\u21BC";
+    case SDL_GameControllerAxis::SDL_CONTROLLER_AXIS_LEFTY:
+        return positive ? "\u21C2" : "\u21BE";
+    case SDL_GameControllerAxis::SDL_CONTROLLER_AXIS_RIGHTX:
+        return positive ? "\u21C1" : "\u21BD";
+    case SDL_GameControllerAxis::SDL_CONTROLLER_AXIS_RIGHTY:
+        return positive ? "\u21C3" : "\u21BF";
+    case SDL_GameControllerAxis::SDL_CONTROLLER_AXIS_TRIGGERLEFT:
+        return positive ? "\u2196" : "\u21DC";
+    case SDL_GameControllerAxis::SDL_CONTROLLER_AXIS_TRIGGERRIGHT:
+        return positive ? "\u2197" : "\u21DD";
+    default:
+        return "Axis " + std::to_string(actual_axis) + (positive ? '+' : '-');
+    }
+}
+
+std::string recomp::InputField::to_string() const {
+    switch ((InputType)input_type) {
+        case InputType::None:
+            return "";
+        case InputType::ControllerDigital:
+            return controller_button_to_string((SDL_GameControllerButton)input_id);
+        case InputType::ControllerAnalog:
+            return controller_axis_to_string(input_id);
+        case InputType::Keyboard:
+            return keyboard_input_to_string((SDL_Scancode)input_id);
+        default:
+            return std::to_string(input_type) + "," + std::to_string(input_id);
+    }
+}

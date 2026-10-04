@@ -1,0 +1,32 @@
+# Config for the --dump-context flag of the N64Recomp tool, which is what
+# produces HybridHeaven-RecompSyms/hybridheaven.syms.toml and
+# .../hybridheaven.datasyms.toml.
+#
+# It lives here rather than in the Syms repo because it is an input to the port,
+# not symbol data -- compare Goemon64Recomp/mnsg.dump_context.toml, which sits in
+# the port repo, not in Goemon64RecompSyms.
+#
+# elf_path points into the decomp submodule. That build is NOT checked in: run
+# `make setup && make` in lib/hybridheaven first, and confirm it prints
+# 61ed3d5d5390c3c17b4026797b93be50a61dd6f2. A decomp build that no longer matches
+# the ROM is an ELF that no longer describes it.
+
+[input]
+entrypoint = 0x80000400
+output_func_path = "RecompiledFuncs"
+elf_path = "lib/hybridheaven/build/usa/hybridheaven.elf"
+relocatable_sections_path = "hybridheaven.overlays.txt"
+bss_section_suffix = "_bss"
+
+# 11 of the 7367 relocs in .main are orphaned LO16s -- a LO16 with no HI16
+# immediately before it. The MIPS System V ABI says such a reloc reuses the
+# previously defined HI16, which is exactly what N64Recomp does, so the warnings
+# are noise rather than a problem to fix.
+unpaired_lo16_warnings = false
+
+[patches]
+stubs = [
+]
+
+ignored = [
+]

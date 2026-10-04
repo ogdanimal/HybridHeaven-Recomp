@@ -1,0 +1,219 @@
+# Tag-triggered RELEASE for HybridHeaven-Recomp: Linux, Windows and Android.
+#
+# Push a tag like `v1.0.1` on main and this builds all three platforms
+# and publishes them as one GitHub Release:
+#   HybridHeaven-<version>-linux-x86_64.tar.gz
+#   HybridHeaven-<version>-windows-x64.zip
+#   HybridHeaven-<version>-android-arm64-v8a.apk   (signed with the upload key)
+#
+# The builds are validate.yml's own jobs, called with `release: true` -- not a
+# copy of them -- so a release is built exactly the way every push is checked.
+# This file adds only what is release-specific: the tag guard, the version, and
+# packaging + publishing.
+#
+# Triggers ONLY on tag pushes, so fork PRs cannot reach the ROM or signing
+# secrets through it; the maintainer pushes the tag.
+#
+# Required repository secrets, beyond the one validate.yml already needs
+# (HHRS_REPO_WITH_PAT):
+#   RELEASE_KEYSTORE_BASE64 -> base64 of the release .jks  (`base64 -w0 release.jks`)
+#   RELEASE_STORE_PASSWORD  -> keystore password
+#   RELEASE_KEY_ALIAS       -> key alias
+#   RELEASE_KEY_PASSWORD    -> key password (= store password for a PKCS12 keystore)
+#
+# What ships is the recompiled game code plus the port's own UI assets -- NO
+# game data. Players supply their own ROM at runtime. The codegen artifact
+# (RecompiledFuncs/, the patch ELF) and the decompressed ROM are never attached:
+# the publish job downloads only the three platform builds, by name, and refuses
+# to publish if a package contains anything ROM-shaped.
+
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # ---------------------------------------------------------------------------
+  guard:
+    name: guard + version
+    runs-on: ubuntu-latest
+    outputs:
+      vname: ${{ steps.ver.outputs.vname }}
+      vcode: ${{ steps.ver.outputs.vcode }}
+      prerelease: ${{ steps.ver.outputs.prerelease }}
+    steps:
+      # No submodules: this job reads history only.
+      - name: Checkout
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          fetch-depth: 0
+
+      # Any `v*` tag on ANY commit would otherwise produce a signed public
+      # release, so a stray tag on a WIP commit could ship unreviewed code.
+      # Same branch model as Goemon64Recomp: work lands on dev, a release is cut
+      # from main once dev is merged into it, and the tagged commit must be on main.
+      - name: Guard -- tag commit must be on main
+        run: |
+          git fetch --no-tags origin main
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" FETCH_HEAD; then
+            echo "::error::Tag ${GITHUB_REF_NAME} (${GITHUB_SHA}) is not on main; refusing to publish."
+            exit 1
+          fi
+          echo "Tag commit is on main -- OK."
+
+      - name: Derive version from tag
+        id: ver
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          # vMAJOR.MINOR.PATCH with an optional -suffix of letters, digits and
+          # dots only. Stricter than Goemon's `[-+].*` on purpose: git allows $,
+          # parentheses and backticks in tag names, and this value flows into
+          # build scripts, a file name and a release title.
+          if ! printf '%s' "$TAG" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$'; then
+            echo "::error::Tag '$TAG' is not vMAJOR.MINOR.PATCH[-suffix]; refusing to release."
+            exit 1
+          fi
+          VNAME="${TAG#v}"            # v0.2.0-rc1 -> 0.2.0-rc1
+          CORE="${VNAME%%-*}"         # 0.2.0-rc1  -> 0.2.0
+          IFS=. read -r MAJOR MINOR PATCH <<< "$CORE"
+          # versionCode = major*10000 + minor*100 + patch: derived from the tag
+          # alone, so it cannot drift with history. Minor and patch stay < 100.
+          if [ "$MINOR" -ge 100 ] || [ "$PATCH" -ge 100 ]; then
+            echo "::error::minor/patch must each be < 100 for the versionCode scheme (got $CORE)."
+            exit 1
+          fi
+          VCODE=$(( MAJOR * 10000 + MINOR * 100 + PATCH ))
+          # A -suffix tag is a PRERELEASE and must never become "Latest release".
+          # An rc shares its final release's versionCode; rc builds are dry runs.
+          if [ "$VNAME" != "$CORE" ]; then PRERELEASE=true; else PRERELEASE=false; fi
+          {
+            echo "vname=$VNAME"
+            echo "vcode=$VCODE"
+            echo "prerelease=$PRERELEASE"
+          } >> "$GITHUB_OUTPUT"
+          echo "Release $TAG -> versionName=$VNAME versionCode=$VCODE prerelease=$PRERELEASE"
+
+  # ---------------------------------------------------------------------------
+  build:
+    name: build
+    needs: guard
+    uses: ./.github/workflows/validate.yml
+    with:
+      release: true
+      vname: ${{ needs.guard.outputs.vname }}
+      vcode: ${{ needs.guard.outputs.vcode }}
+    secrets: inherit
+
+  # ---------------------------------------------------------------------------
+  publish:
+    name: package + publish
+    needs: [guard, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # to create the GitHub Release
+    env:
+      VNAME: ${{ needs.guard.outputs.vname }}
+    steps:
+      # By name, one at a time: never a pattern that could also match `codegen`.
+      - name: Download Linux build
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: HybridHeaven-linux-${{ github.sha }}
+          path: in/linux
+      - name: Download Windows build
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: HybridHeaven-windows-${{ github.sha }}
+          path: in/windows
+      - name: Download Android build
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: HybridHeaven-android-release-${{ github.sha }}
+          path: in/android
+
+      - name: Package
+        run: |
+          mkdir -p out
+          # Linux: the binary beside assets/, because assets are found relative
+          # to the working directory -- run it from inside the folder. Artifacts
+          # drop the exec bit, and the debug info is not worth the download.
+          L="HybridHeaven-${VNAME}-linux-x86_64"
+          mkdir -p "pkg/$L"
+          cp in/linux/build/HybridHeavenRecompiled "pkg/$L/"
+          chmod +x "pkg/$L/HybridHeavenRecompiled"
+          strip --strip-debug "pkg/$L/HybridHeavenRecompiled"
+          cp -r in/linux/assets in/linux/recompcontrollerdb.txt "pkg/$L/"
+          tar -C pkg --owner=0 --group=0 -czf "out/$L.tar.gz" "$L"
+
+          # Windows: the artifact is already the folder the .exe runs from.
+          W="HybridHeaven-${VNAME}-windows-x64"
+          mkdir -p "pkg/$W"
+          cp -r in/windows/. "pkg/$W/"
+          (cd pkg && zip -qr "../out/$W.zip" "$W")
+
+          # Each desktop package must carry its UI: v1.0.0-rc1's Windows zip had no
+          # assets/ at all and could not have started.
+          for P in "pkg/$L" "pkg/$W"; do
+            test -f "$P/assets/config_menu.rml" \
+              || { echo "::error::$P has no assets/config_menu.rml"; exit 1; }
+          done
+
+          APK=$(find in/android -name '*.apk' | head -1)
+          test -n "$APK" || { echo "::error::no APK in the Android artifact"; exit 1; }
+          cp "$APK" "out/HybridHeaven-${VNAME}-android-arm64-v8a.apk"
+          ls -la out
+
+      # Last line of defence for the one thing a release must never carry. The
+      # build artifacts are not supposed to hold any of this; check anyway,
+      # because a release cannot be un-downloaded.
+      - name: Refuse anything ROM-shaped
+        run: |
+          if find pkg -iname '*.z64' -o -iname '*.n64' -o -iname '*.v64' \
+                  -o -iname '*.elf' -o -name 'RecompiledFuncs' -o -name 'funcs_*.c' \
+             | grep -q .; then
+            echo "::error::A package contains a ROM, an ELF or generated game source."
+            find pkg -iname '*.z64' -o -iname '*.n64' -o -iname '*.v64' -o -iname '*.elf' \
+                 -o -name 'RecompiledFuncs' -o -name 'funcs_*.c'
+            exit 1
+          fi
+          unzip -l out/*.zip | grep -i -E '\.(z64|n64|v64|elf)$' && exit 1
+          tar -tzf out/*.tar.gz | grep -i -E '\.(z64|n64|v64|elf)$' && exit 1
+          echo "No ROM, ELF or generated source in any package."
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PRERELEASE: ${{ needs.guard.outputs.prerelease }}
+        run: |
+          # --notes, not --notes-file: gh documents prepending to the generated
+          # notes for --notes specifically.
+          FLAGS=()
+          if [ "$PRERELEASE" = "true" ]; then FLAGS+=(--prerelease); fi
+          cat > notes.md <<'EOF'
+          **You need your own Hybrid Heaven (USA) cartridge dump** -- sha1
+          `16dbc21620b52deab5c5abf8a309ac60adfbee85`. Nothing here contains game data.
+
+          - **Windows**: unzip and run `HybridHeavenRecompiled.exe`. Needs a Vulkan GPU.
+          - **Linux**: extract, then run `./HybridHeavenRecompiled` from inside the
+            folder. Needs SDL2 and GTK 3 (`libsdl2-2.0-0`, `libgtk-3-0`) and a Vulkan GPU.
+          - **Android**: install the APK (Android 9+, arm64, Vulkan). Replacing a
+            debug build needs an uninstall first -- the signatures differ -- and an
+            uninstall DELETES the app's saves. Copy `hybridheaven.us.bin` off the
+            device before uninstalling, then bring it back with Settings -> Saves.
+          EOF
+          gh release create "$GITHUB_REF_NAME" out/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "Hybrid Heaven: Recompiled $GITHUB_REF_NAME" \
+            --notes "$(cat notes.md)" \
+            --generate-notes \
+            --verify-tag \
+            "${FLAGS[@]}"

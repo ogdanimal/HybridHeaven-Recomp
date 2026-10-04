@@ -1,0 +1,418 @@
+# Build validation for HybridHeaven-Recomp: Linux, Windows and Android.
+#
+# On a push this is validation only: nothing is signed or published, and every
+# job uploads a short-lived artifact so a build can be inspected.
+#
+# release.yml also CALLS this workflow (workflow_call, `release: true`) so that a
+# tagged release is built by exactly the same steps rather than by a copy of
+# them that could drift. In that mode the desktop builds carry the tag's version
+# and Android builds a SIGNED release APK instead of a debug one; publishing is
+# release.yml's job, not this one's. On a push `inputs` is empty, so every
+# `inputs.release` below reads false.
+#
+# THE SHAPE IS DECIDED BY ONE CONSTRAINT: the decomp cannot build anywhere but
+# Linux. lib/hybridheaven/tools/ido-5.3/* are Linux x86-64 ELF binaries, so splat
+# and the IDO build of 137 translation units only run on a Linux runner. Since
+# hybridheaven.toml uses elf_path (see "Why this uses elf_path" in
+# docs/development-notes.md), the recompilation needs that build -- so codegen
+# happens ONCE, in its own job, and the three build jobs consume its output.
+#
+# That also means the expensive part is paid once rather than three times.
+#
+# Required secret:
+#   HHRS_REPO_WITH_PAT -> https://x-access-token:<PAT>@github.com/ogdanimal/HybridHeaven-RecompSecrets.git
+#   holding hybridheaven.us.z64 at its root: the RETAIL cart dump, sha1 16dbc216...
+#   (Goemon64Recomp and Quest64-Recomp store a DECOMPRESSED ROM instead, because
+#   their .toml uses symbols_file_path and their CI never builds a decomp. Putting
+#   a decompressed image in ours would break `make setup`, which decompresses.)
+#
+# Fork PRs cannot run this: push + workflow_dispatch only, so the ROM secret is
+# never in scope for unmerged code. Quest64's pull_request_target + `external`
+# environment gate is what to add if outside contributors arrive -- and note that
+# gate's security lives in repo SETTINGS, not in its YAML.
+
+name: validate
+
+on:
+  workflow_call:
+    inputs:
+      release:
+        type: boolean
+        default: false
+      vname:      # versionName, the tag minus its leading v (1.2.0, 1.2.0-rc1)
+        type: string
+        default: ''
+      vcode:      # Android versionCode, major*10000 + minor*100 + patch
+        type: string
+        default: ''
+  workflow_dispatch:
+  push:
+    branches: [dev, main]
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - '.gitignore'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: validate-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ---------------------------------------------------------------------------
+  codegen:
+    name: codegen (decomp + recompiler)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          submodules: recursive
+
+      - name: Install host toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build cmake clang lld llvm make \
+                                  binutils-mips-linux-gnu
+
+      - name: Install uv (the decomp manages Python with it)
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+
+      - name: Record the decomp commit (cache key)
+        id: decomp
+        run: echo "sha=$(git -C lib/hybridheaven rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: ccache
+        uses: hendrikmuhs/ccache-action@d62db5f07c26379fc4b4e0916f098a92573c3b03 # v1.2.23
+        with:
+          key: codegen-${{ steps.decomp.outputs.sha }}
+
+      # A pure function of the decomp commit and the ROM, and the ROM never
+      # changes -- so the commit alone is a sound key.
+      - name: Cache the decomp build
+        id: decomp-cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            lib/hybridheaven/build
+            lib/hybridheaven/asm
+            lib/hybridheaven/bin
+            lib/hybridheaven/.splat
+            lib/hybridheaven/config/usa/baserom.decompressed.z64
+          key: decomp-${{ steps.decomp.outputs.sha }}
+
+      - name: Fetch private build inputs (ROM)
+        run: |
+          git clone "${{ secrets.HHRS_REPO_WITH_PAT }}" HybridHeavenSecrets
+          # The one file, never a wildcard.
+          cp -v ./HybridHeavenSecrets/hybridheaven.us.z64 \
+                lib/hybridheaven/config/usa/baserom.z64
+          # Delete the clone immediately: its .git/config holds the PAT.
+          rm -rf HybridHeavenSecrets
+          echo "16dbc21620b52deab5c5abf8a309ac60adfbee85  lib/hybridheaven/config/usa/baserom.z64" \
+            | sha1sum -c -
+
+      - name: Build the decomp (ELF + decompressed ROM)
+        if: steps.decomp-cache.outputs.cache-hit != 'true'
+        working-directory: lib/hybridheaven
+        run: |
+          make setup
+          make -j "$(nproc)"
+
+      - name: Stage the decompressed ROM
+        run: |
+          cp -v lib/hybridheaven/config/usa/baserom.decompressed.z64 hybridheaven.z64
+          echo "61ed3d5d5390c3c17b4026797b93be50a61dd6f2  hybridheaven.z64" | sha1sum -c -
+          test -f lib/hybridheaven/build/usa/hybridheaven.elf
+
+      # From the PINNED SUBMODULE, never an upstream clone: this port carries four
+      # local N64Recomp patches on hybridheaven-port, and an upstream binary would
+      # silently emit code missing all of them.
+      - name: Build N64Recomp & RSPRecomp
+        run: |
+          export PATH="/usr/lib/ccache:$PATH"
+          cmake -G Ninja -S lib/N64ModernRuntime/N64Recomp -B build-n64recomp \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DCMAKE_C_COMPILER_LAUNCHER=ccache
+          cmake --build build-n64recomp --target N64RecompCLI -j "$(nproc)"
+          cmake --build build-n64recomp --target RSPRecomp    -j "$(nproc)"
+
+      - name: Recompile game + RSP microcode
+        run: |
+          ./build-n64recomp/N64Recomp hybridheaven.toml   # -> RecompiledFuncs/
+          ./build-n64recomp/RSPRecomp aspMain.toml        # -> rsp/aspMain.cpp
+          test "$(ls RecompiledFuncs/*.c | wc -l)" -gt 0
+
+      - name: Generate patch codegen
+        run: |
+          make -C patches CC=clang LD=ld.lld
+          ./build-n64recomp/N64Recomp patches.toml
+          cmake -DINPUT=$PWD/patches/patches.bin \
+                -DSYMBOL=hh_patches_bin \
+                -DOUT_C=$PWD/RecompiledPatches/patches_bin.c \
+                -DOUT_H=$PWD/RecompiledPatches/patches_bin.h \
+                -P cmake/embed_binary.cmake
+          test -f RecompiledPatches/patches_bin.c
+
+      # Generated sources only. hybridheaven.z64 is deliberately NOT here: it is
+      # the decompressed ROM. RecompiledFuncs/ is still the game's code as C, so
+      # this artifact is short-lived and must never be attached to a release.
+      - name: Upload codegen
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: codegen
+          path: |
+            RecompiledFuncs/
+            RecompiledPatches/
+            rsp/aspMain.cpp
+            patches/patches.bin
+            patches/build/patches.elf
+            build-n64recomp/N64Recomp
+          if-no-files-found: error
+          retention-days: 1
+
+  # ---------------------------------------------------------------------------
+  linux:
+    name: linux
+    needs: codegen
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          submodules: recursive
+
+      - name: Download codegen
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: codegen
+
+      # libsdl2-dev: CMakeLists does find_package(SDL2 REQUIRED) off Windows and
+      # Android. libgtk-3-dev: nfd (nativefiledialog-extended) is GTK on Linux.
+      # clang/lld/make are here because CMake owns the patch codegen on Linux and
+      # may decide to re-run it -- artifact downloads do not preserve mtimes.
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build cmake clang lld llvm make \
+                                  libsdl2-dev libgtk-3-dev
+
+      - name: ccache
+        uses: hendrikmuhs/ccache-action@d62db5f07c26379fc4b4e0916f098a92573c3b03 # v1.2.23
+        with:
+          key: linux-${{ github.sha }}
+
+      # Artifacts do not preserve the executable bit.
+      - name: Restore the recompiler's exec bit
+        run: chmod +x build-n64recomp/N64Recomp
+
+      # The version arrives through env, never pasted into the script: it comes
+      # from a tag name, and the shell should only ever see it as data.
+      - name: Build
+        env:
+          VNAME: ${{ inputs.vname }}
+        run: |
+          export PATH="/usr/lib/ccache:$PATH"
+          VERSION_ARG=""
+          if [ -n "$VNAME" ]; then VERSION_ARG="-DHH_VERSION_STRING=$VNAME"; fi
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DHH_N64RECOMP=$PWD/build-n64recomp/N64Recomp \
+            $VERSION_ARG
+          cmake --build build -j "$(nproc)"
+          test -x build/HybridHeavenRecompiled
+
+      - name: Upload build
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: HybridHeaven-linux-${{ github.sha }}
+          path: |
+            build/HybridHeavenRecompiled
+            assets/
+            recompcontrollerdb.txt
+          if-no-files-found: error
+          retention-days: 7
+
+  # ---------------------------------------------------------------------------
+  windows:
+    name: windows
+    needs: codegen
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          submodules: recursive
+
+      - name: Download codegen
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: codegen
+
+      - name: Install ninja
+        run: choco install ninja -y
+
+      - name: Configure Developer Command Prompt
+        uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1.13.0
+
+      # SDL2 needs no install here: CMakeLists fetches the prebuilt VC package,
+      # and reads the version from the environment so a CI pin needs no edit.
+      # The patch codegen does NOT run on Windows -- it needs make/clang/ld.lld to
+      # link a MIPS ELF as host tools -- so CMake consumes RecompiledPatches/ from
+      # the codegen artifact and fails the configure with an explanation if absent.
+      - name: Build
+        shell: pwsh
+        env:
+          SDL2_VERSION: '2.30.3'
+          VNAME: ${{ inputs.vname }}
+        run: |
+          # Use VS's own clang-cl rather than any standalone LLVM on PATH.
+          $env:PATH = ($env:PATH -split ';' | Where-Object { $_ -ne 'C:\Program Files\LLVM\bin' }) -join ';'
+          $cores = (Get-CimInstance -ClassName Win32_Processor).NumberOfLogicalProcessors
+          # clang-cl is mandatory: the configure refuses cl.exe outright, because
+          # RECOMP_FUNC's MSVC branch has no weak linkage and the patch override
+          # depends on weak symbols. /WHOLEARCHIVE:PatchesLib does the rest.
+          $versionArg = @()
+          if ($env:VNAME) { $versionArg = @("-DHH_VERSION_STRING=$env:VNAME") }
+          cmake -S . -B build-win -G Ninja `
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo `
+            -DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl `
+            @versionArg
+          # HybridHeavenAssets is a separate ALL target that copies assets/ beside
+          # the .exe; --target alone skips it. Without assets/ the UI cannot start,
+          # and upload-artifact only fails when NO path matches, so the missing
+          # folder went unnoticed until v1.0.0-rc1 shipped a zip with none.
+          cmake --build build-win --target HybridHeavenRecompiled HybridHeavenAssets -j $cores
+          if (-not (Test-Path build-win/HybridHeavenRecompiled.exe)) { exit 1 }
+          if (-not (Test-Path build-win/assets/config_menu.rml)) { Write-Error "assets/ was not deployed beside the .exe"; exit 1 }
+
+      - name: Upload build
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: HybridHeaven-windows-${{ github.sha }}
+          path: |
+            build-win/HybridHeavenRecompiled.exe
+            build-win/*.dll
+            build-win/assets/
+            build-win/recompcontrollerdb.txt
+          if-no-files-found: error
+          retention-days: 7
+
+  # ---------------------------------------------------------------------------
+  android:
+    name: android (arm64-v8a ${{ inputs.release && 'release' || 'debug' }})
+    needs: codegen
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          # --recursive matters: lib/libadrenotools has a submodule of its own
+          # (linkernsbypass), and the custom-driver build fails inside
+          # add_subdirectory() without it, with an error that never says so.
+          submodules: recursive
+
+      - name: Download codegen
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: codegen
+
+      - name: Validate Gradle wrapper
+        uses: gradle/actions/wrapper-validation@ed408507eac070d1f99cc633dbcf757c94c7933a # v4
+
+      - name: Build host file_to_c
+        run: |
+          mkdir -p build-host-tools
+          c++ -std=c++17 -O2 -o build-host-tools/file_to_c_host \
+            lib/rt64/src/tools/file_to_c/file_to_c.cpp
+          test -x build-host-tools/file_to_c_host
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@03ad4de0992f5dab5e18fcb136590ce7c4a0ac95 # v5
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      # packages: the action's default is 'tools platform-tools', and Google has
+      # withdrawn the long-obsolete `tools` package from the SDK repository, so
+      # the default now fails ("Failed to find package 'tools'") before any build
+      # runs. Nothing here needs it: the NDK and CMake come from the next step.
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@40fd30fb8d7440372e1316f5d1809ec01dcd3699 # v4
+        with:
+          packages: 'platform-tools'
+
+      - name: Install pinned NDK + CMake
+        run: |
+          yes | sdkmanager --licenses > /dev/null || true
+          sdkmanager "ndk;27.1.12297006" "cmake;3.22.1"
+
+      # -PcustomDriver=true matches what a release build ships, so a break in
+      # libadrenotools, the four hook libraries or plume's loader hook surfaces
+      # here rather than first in a release.
+      - name: Build debug APK
+        if: ${{ !inputs.release }}
+        working-directory: android
+        run: ./gradlew assembleDebug --no-daemon --stacktrace -PcustomDriver=true
+
+      # Release mode only. build.gradle signs a release build with whatever
+      # keystore.properties names, and silently leaves it UNSIGNED when there is
+      # none -- so a missing secret is refused here, and the result is verified
+      # below rather than assumed.
+      - name: Decode keystore + write keystore.properties
+        if: ${{ inputs.release }}
+        env:
+          KEYSTORE_B64: ${{ secrets.RELEASE_KEYSTORE_BASE64 }}
+          STORE_PW: ${{ secrets.RELEASE_STORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.RELEASE_KEY_ALIAS }}
+          KEY_PW: ${{ secrets.RELEASE_KEY_PASSWORD }}
+        run: |
+          if [ -z "$KEYSTORE_B64" ]; then
+            echo "::error::RELEASE_KEYSTORE_BASE64 is not set -- cannot sign a release."
+            exit 1
+          fi
+          echo "$KEYSTORE_B64" | base64 -d > android/release.jks
+          # storeFile resolves against keystore.properties' own directory (android/).
+          cat > android/keystore.properties <<EOF
+          storeFile=release.jks
+          storePassword=$STORE_PW
+          keyAlias=$KEY_ALIAS
+          keyPassword=$KEY_PW
+          EOF
+
+      - name: Build signed release APK
+        if: ${{ inputs.release }}
+        working-directory: android
+        env:
+          VNAME: ${{ inputs.vname }}
+          VCODE: ${{ inputs.vcode }}
+        run: |
+          ./gradlew assembleRelease --no-daemon --stacktrace \
+            -PvName="$VNAME" -PvCode="$VCODE" \
+            -PcustomDriver=true
+
+      - name: Verify the APK is release-signed (not debug)
+        if: ${{ inputs.release }}
+        run: |
+          APK=$(find android/app/build/outputs/apk/release -name "*.apk" | head -1)
+          test -n "$APK" || { echo "::error::no release APK found"; exit 1; }
+          BUILD_TOOLS=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)
+          "$BUILD_TOOLS/apksigner" verify --print-certs "$APK" | tee certs.txt
+          if grep -qi "CN=Android Debug" certs.txt; then
+            echo "::error::APK is debug-signed -- release signing did not take effect."
+            exit 1
+          fi
+
+      - name: Clean up signing material
+        if: ${{ always() && inputs.release }}
+        run: rm -f android/release.jks android/keystore.properties
+
+      - name: Upload APK
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: HybridHeaven-android-${{ inputs.release && 'release' || 'debug' }}-${{ github.sha }}
+          path: android/app/build/outputs/apk/${{ inputs.release && 'release' || 'debug' }}/*.apk
+          if-no-files-found: error
+          retention-days: 7

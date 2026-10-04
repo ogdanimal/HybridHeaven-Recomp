@@ -1,0 +1,65 @@
+--- a/src/recompilation.cpp
++++ b/src/recompilation.cpp
+@@ -101,6 +101,41 @@
+     return JalResolutionResult::Error;
+ }
+ 
++// Whether more than one relocatable section defines a function at this vram.
++//
++// Such an address does not identify a function. It identifies a slot that
++// several overlays take turns in, and which of them is resident is a runtime
++// question. `resolve_jal` cannot see this on its own: a jal carrying an
++// R_MIPS_26 reloc arrives with a section already chosen -- whichever tenant the
++// linker happened to attribute the symbol to when the ELF was built -- and that
++// choice is a guess wearing the clothes of a fact.
++static bool is_ambiguous_relocatable_target(const N64Recomp::Context& context, uint32_t target_func_vram) {
++    const auto matching_funcs_find = context.functions_by_vram.find(target_func_vram);
++    if (matching_funcs_find == context.functions_by_vram.end()) {
++        return false;
++    }
++
++    size_t relocatable_sections = 0;
++    size_t last_section_index = (size_t)-1;
++
++    for (size_t target_func_index : matching_funcs_find->second) {
++        const auto& target_func = context.functions[target_func_index];
++        if (target_func.words.empty() || (size_t)target_func.section_index >= context.sections.size()) {
++            continue;
++        }
++        if (!context.sections[target_func.section_index].relocatable) {
++            continue;
++        }
++        // Two symbols in one section at one vram are aliases, not a choice.
++        if ((size_t)target_func.section_index != last_section_index) {
++            last_section_index = target_func.section_index;
++            relocatable_sections++;
++        }
++    }
++
++    return relocatable_sections > 1;
++}
++
+ using InstrId = rabbitizer::InstrId::UniqueId;
+ using Cop0Reg = rabbitizer::Registers::Cpu::Cop0;
+ 
+@@ -308,6 +343,20 @@
+                         fmt::print(stderr, "No function found for jal target: 0x{:08X}\n", target_func_vram);
+                         return false;
+                     case JalResolutionResult::Match:
++                        // A match reached through another section's reloc is only as good as the
++                        // linker's attribution of that address, and when several relocatable
++                        // sections define a function at the target vram the attribution is
++                        // arbitrary. Binding it statically calls a tenant that may not even be
++                        // loaded. Resolve it at runtime, where the loaded overlay is known.
++                        //
++                        // A call whose target section IS the caller's own section is left alone:
++                        // that one is genuinely unambiguous, since the caller running at all means
++                        // its own section is resident.
++                        if (target_section != func.section_index &&
++                            is_ambiguous_relocatable_target(context, target_func_vram)) {
++                            call_by_lookup = true;
++                            break;
++                        }
+                         jal_target_name = context.functions[matched_func_index].name;
+                         break;
+                     case JalResolutionResult::CreateStatic:

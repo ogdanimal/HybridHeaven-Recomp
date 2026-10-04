@@ -1,0 +1,29 @@
+[submodule "lib/N64ModernRuntime"]
+	path = lib/N64ModernRuntime
+	url = https://github.com/ogdanimal/N64ModernRuntime
+	branch = hybridheaven-port
+[submodule "lib/rt64"]
+	path = lib/rt64
+	url = https://github.com/ogdanimal/rt64
+	branch = goemon-android
+[submodule "lib/hybridheaven"]
+	path = lib/hybridheaven
+	url = https://github.com/ogdanimal/HybridHeaven-Decomp
+[submodule "HybridHeaven-RecompSyms"]
+	path = HybridHeaven-RecompSyms
+	url = https://github.com/ogdanimal/HybridHeaven-RecompSyms
+[submodule "lib/RmlUi"]
+	path = lib/RmlUi
+	url = https://github.com/mikke89/RmlUi/
+	branch = 6.0
+[submodule "lib/lunasvg"]
+	path = lib/lunasvg
+	url = https://github.com/sammycage/lunasvg
+	branch = v2.4.1
+[submodule "lib/freetype-windows-binaries"]
+	path = lib/freetype-windows-binaries
+	url = https://github.com/ubawurinna/freetype-windows-binaries
+	branch = v2.13.2
+[submodule "lib/libadrenotools"]
+	path = lib/libadrenotools
+	url = https://github.com/bylaws/libadrenotools.git

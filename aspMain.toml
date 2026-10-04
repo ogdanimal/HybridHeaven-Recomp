@@ -1,0 +1,31 @@
+# Hybrid Heaven's audio microcode, for RSPRecomp.
+#
+# aspMain is the ONLY microcode this port has to recompile. There are exactly
+# two SP tasks -- gfx (F3DEX 2.06, M_GFXTASK) and audio (aspMain, M_AUDTASK) --
+# and RT64 implements F3DEX itself. A full-ROM density scan finds no third
+# ucode. See lib/hybridheaven/PLAN.md Phase B for the derivation.
+#
+# rom_file_path is the DECOMPRESSED ROM (sha1 61ed3d5d...), as in Goemon64Recomp,
+# so ROM offsets taken from the decomp are valid here unchanged.
+#
+# text_address comes from this ROM, not inherited: rspboot (ROM 0x35CD0, vram
+# 0x800350D0) contains `addi $a3, $zero, 0x1080` feeding the SP DMA address
+# register, so the ucode text is DMA'd to SP memory 0x1080 => 0x04001080.
+#
+# The blob is byte-for-byte identical to Mystical Ninja's -- microcode text
+# carries no relocations, and both games are IDO-built against libultra 2.0H.
+# With the 16 targets below, RSPRecomp reproduces Goemon64Recomp/rsp/aspMain.cpp
+# byte-for-byte; without them the output differs by exactly those 16 labels and
+# their jump-table entries, which is what proves the list transfers rather than
+# merely looks plausible.
+
+text_offset = 0x37130
+text_size = 0xE20
+text_address = 0x04001080
+rom_file_path = "hybridheaven.z64"
+output_file_path = "rsp/aspMain.cpp"
+output_function_name = "aspMain"
+extra_indirect_branch_targets = [
+    0x1118, 0x1470, 0x11DC, 0x1B38, 0x1214, 0x187C, 0x1254, 0x12D0,
+    0x12EC, 0x1328, 0x140C, 0x1294, 0x1E24, 0x138C, 0x170C, 0x144C,
+]

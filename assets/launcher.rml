@@ -1,0 +1,141 @@
+<rml>
+	<head>
+		<title>Launcher</title>
+		<link type="text/rcss" href="rml.rcss"/>
+		<link type="text/rcss" href="recomp.rcss"/>
+		<style>
+			body
+			{
+				width: 100%;
+				height: 100%;
+			}
+
+			/* The launcher's cover art. These rules live here rather than in
+			   recomp.rcss because that file is GENERATED from assets/scss by a
+			   sass step that only runs under Windows' npm, so an edit there would
+			   be overwritten by the next build and would not survive in the
+			   source. They are launcher-only styling, so the document is the right
+			   home for them either way.
+
+			   The image is registered from C++ under the name below before this
+			   document is created; see register_launcher_background in
+			   src/ui/ui_launcher.cpp. The `?/` prefix is what stops RmlUi
+			   resolving the name as a file path relative to this document, and
+			   without it the renderer silently substitutes a 1x1 transparent
+			   texture rather than reporting anything. */
+			.launcher__backdrop
+			{
+				display: flex;
+				position: absolute;
+				top: 0;
+				right: 0;
+				bottom: 0;
+				left: 0;
+				align-items: center;
+				justify-content: center;
+				overflow: hidden;
+			}
+
+			/* Fitted to the WIDTH and centred. Fitting to the height instead would
+			   cover the window whatever its shape, but only by cropping the sides
+			   off — and the sides are where half the cast is.
+
+			   The artist's painting is 3.1:1; the file here is 16:9, and the
+			   difference is where the seam was. Left at 3.1:1 it sat in a band with
+			   .launcher's #0D0A07 above and below, and the two blacks do not match:
+			   the painting's top and bottom rows are a dark BLUE, about
+			   rgb(10,11,30), against a warm near-black. No flat colour fixes that
+			   either, because the painting's edge is pure black at the far left and
+			   right and blue through the middle.
+
+			   So the transition happens inside the image. Its own edge rows are
+			   extended outward — smoothed horizontally first, since stretching a
+			   single row leaves vertical streaks — and then faded into #0D0A07 over
+			   the outer 230px, so the file's outermost rows ARE the launcher's
+			   colour. Any band left at a window shape other than 16:9 is therefore
+			   invisible. README.md carries the command that builds it. */
+			.launcher__backdrop-art
+			{
+				width: 100%;
+				height: auto;
+			}
+
+			/* Readability. The menu column sits over the right-hand third of the
+			   art, which is the busiest part of it. */
+			.launcher__backdrop-scrim
+			{
+				position: absolute;
+				top: 0;
+				right: 0;
+				bottom: 0;
+				left: 0;
+				background-color: rgba(13, 10, 7, 0.55);
+			}
+		</style>
+	</head>
+	<body>
+		<div id="window" data-model="launcher_model">
+			<div class="launcher">
+				<!-- The cover art, first child so everything below paints over it.
+				     Goemon64Recomp puts its art in a .launcher__background-wrapper
+				     inside the right-hand column, sized to the height and faded to
+				     0.1 as a watermark behind the menu; this is a full-width
+				     backdrop across the whole launcher instead, because the artwork
+				     is a wide cast line-up rather than a single character.
+
+				     Art by I_LIKE_SONIC. -->
+				<div class="launcher__backdrop">
+					<img class="launcher__backdrop-art" src="?/launcher/background"/>
+					<div class="launcher__backdrop-scrim"></div>
+				</div>
+
+				<!-- One game, so one panel. Goemon64Recomp's launcher split the
+				     screen in two because it offers Goemon's Great Adventure
+				     alongside Mystical Ninja. The right-hand half is kept, because
+				     that is the half recomp.rcss styles as the selected one; the
+				     left is the empty column beside it. -->
+				<div class="launcher__vertical-split">
+					<div class="launcher__title-quadrant"></div>
+					<div class="launcher__content-quadrant"></div>
+				</div>
+				<div class="launcher__vertical-split launcher__vertical-split--right">
+					<div class="launcher__title-quadrant launcher__title-quadrant--right">
+						<button class="subtitle-title subtitle-title--right" selected>
+							<div><h3>Hybrid Heaven: Recompiled</h3></div>
+							<div><h1>Hybrid Heaven</h1></div>
+						</button>
+					</div>
+					<div class="launcher__content-quadrant">
+						<button data-if="!rom_valid" onclick="select_rom" class="menu-list-item menu-list-item--right" autofocus>
+							<div class="menu-list-item__bullet"></div>
+							<div class="menu-list-item__label">Select ROM</div>
+						</button>
+						<button data-if="rom_valid" onclick="start_game" class="menu-list-item menu-list-item--right" autofocus>
+							<div class="menu-list-item__bullet"></div>
+							<div class="menu-list-item__label">Start Game</div>
+						</button>
+						<button onclick="open_controls" class="menu-list-item menu-list-item--right">
+							<div class="menu-list-item__bullet"></div>
+							<div class="menu-list-item__label">Controls</div>
+						</button>
+						<button onclick="open_settings" class="menu-list-item menu-list-item--right">
+							<div class="menu-list-item__bullet"></div>
+							<div class="menu-list-item__label">Settings</div>
+						</button>
+						<button onclick="open_mods" class="menu-list-item menu-list-item--right">
+							<div class="menu-list-item__bullet"></div>
+							<div class="menu-list-item__label">Mods</div>
+						</button>
+						<button onclick="exit_game" class="menu-list-item menu-list-item--right">
+							<div class="menu-list-item__bullet"></div>
+							<div class="menu-list-item__label">Exit</div>
+						</button>
+					</div>
+				</div>
+				<div class="bottom-left">
+					<label>v{{version_number}}</label>
+				</div>
+			</div>
+		</div>
+	</body>
+</rml>

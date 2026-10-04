@@ -1,0 +1,217 @@
+diff --git a/librecomp/include/librecomp/overlays.hpp b/librecomp/include/librecomp/overlays.hpp
+index 35703bd..6ebaa91 100644
+--- a/librecomp/include/librecomp/overlays.hpp
++++ b/librecomp/include/librecomp/overlays.hpp
+@@ -31,6 +31,45 @@ namespace recomp {
+         void register_manual_patch_symbols(const ManualPatchSymbol* manual_patch_symbols);
+         void read_patch_data(uint8_t* rdram, gpr patch_data_address);
+ 
++        // Controls what `load_overlay` does with `section_addresses`, which the
++        // recompiled RELOC_HI16/RELOC_LO16 read to resolve a relocatable section's
++        // own absolute references.
++        //
++        // Enabled (the default), a section loaded away from its link address has
++        // its references rebased onto wherever it was loaded -- correct for a game
++        // that relocates an overlay after moving it, or maps it to a fixed virtual
++        // address.
++        //
++        // Disabled, `section_addresses` keeps the link address whatever a load
++        // passes. That is what a game which moves an overlay and does NOT relocate
++        // it actually does on hardware: the copied instructions still carry their
++        // original absolute addresses, so they reach the original copy's data no
++        // matter where the copy runs from. Such a game can have the same section
++        // live at two addresses at once, which a per-load address cannot describe
++        // -- one of the two copies would always be rebased onto the other's data.
++        void set_overlay_relocation_enabled(bool enabled);
++
++        // Controls what `unload_overlapping_overlays` does with a loaded section
++        // that a load overwrites only *part* of.
++        //
++        // Enabled (the default), only the functions whose bytes the load actually
++        // destroys lose their entry in the function map; the section stays loaded
++        // and the rest of it stays callable, which is what the same load does to
++        // rdram on hardware.
++        //
++        // Disabled, any overlap drops the whole section. That is safe in the sense
++        // that nothing stale can be reached, but it is wrong for a game that loads
++        // a small overlay into the middle of a larger one's region: every function
++        // of the larger overlay outside the overwritten range is still valid code
++        // that the game may still call, and dropping it turns a legitimate call
++        // into a `Failed to find function` exit.
++        void set_partial_eviction_enabled(bool enabled);
++
++        // Number of functions dropped out of surviving sections since the last
++        // call, and resets the counter. Sections dropped whole are counted by
++        // `unload_overlapping_overlays`'s return value instead.
++        uint32_t take_partial_eviction_func_count();
++
+         void init_overlays();
+         const std::unordered_map<uint32_t, uint16_t>& get_vrom_to_section_map();
+         uint32_t get_section_ram_addr(uint16_t code_section_index);
+@@ -63,5 +102,6 @@ namespace recomp {
+ 
+ extern "C" void load_overlays(uint32_t rom, int32_t ram_addr, uint32_t size);
+ extern "C" void unload_overlays(int32_t ram_addr, uint32_t size);
++extern "C" uint32_t unload_overlapping_overlays(int32_t ram_addr, uint32_t size);
+ 
+ #endif
+diff --git a/librecomp/src/overlays.cpp b/librecomp/src/overlays.cpp
+index cd42676..6b310cb 100644
+--- a/librecomp/src/overlays.cpp
++++ b/librecomp/src/overlays.cpp
+@@ -46,6 +46,13 @@ extern "C" {
+ int32_t* section_addresses = nullptr;
+ }
+ 
++// See recomp::overlays::set_overlay_relocation_enabled.
++static bool overlay_relocation_enabled = true;
++
++void recomp::overlays::set_overlay_relocation_enabled(bool enabled) {
++    overlay_relocation_enabled = enabled;
++}
++
+ void recomp::overlays::register_overlays(const overlay_section_table_data_t& sections, const overlays_by_index_t& overlays) {
+     sections_info = sections;
+     overlays_info = overlays;
+@@ -150,6 +157,76 @@ void recomp::overlays::add_loaded_function(int32_t ram, recomp_func_t* func) {
+     func_map[ram] = func;
+ }
+ 
++// Removes one loaded section from the function map and the loaded-section list,
++// and returns an iterator to the entry after it.
++static std::vector<LoadedSection>::iterator drop_loaded_section(std::vector<LoadedSection>::iterator it) {
++    const SectionTableEntry& section = sections_info.code_sections[it->section_table_index];
++
++    // Determine where each function was loaded to and remove that entry from the function map
++    for (size_t func_index = 0; func_index < section.num_funcs; func_index++) {
++        const auto& func = section.funcs[func_index];
++        uint32_t func_address = func.offset + it->loaded_ram_addr;
++        auto func_it = func_map.find(func_address);
++        // Only remove the mapping if it still refers to this section. Two sections
++        // loaded to overlapping addresses can define a function at the same address,
++        // in which case whichever loaded later owns the entry and must keep it.
++        if (func_it != func_map.end() && func_it->second == func.func) {
++            func_map.erase(func_it);
++        }
++    }
++    // Reset the section's address in the address table
++    section_addresses[section.index] = section.ram_addr;
++    // Remove the section from the loaded section map
++    return loaded_sections.erase(it);
++}
++
++// See recomp::overlays::set_partial_eviction_enabled.
++static bool partial_eviction_enabled = true;
++static uint32_t partial_eviction_funcs = 0;
++
++void recomp::overlays::set_partial_eviction_enabled(bool enabled) {
++    partial_eviction_enabled = enabled;
++}
++
++uint32_t recomp::overlays::take_partial_eviction_func_count() {
++    uint32_t count = partial_eviction_funcs;
++    partial_eviction_funcs = 0;
++    return count;
++}
++
++// Removes from the function map only those functions of one loaded section that
++// [start, end) actually overwrites, leaving the section loaded and the rest of
++// its functions callable.
++//
++// This is what the hardware does. A load into the middle of a larger overlay's
++// region destroys the bytes it covers and nothing else; the code above and below
++// it is still sitting in rdram, still valid, and the game is free to call it.
++// Dropping the whole section instead turns every one of those survivors into a
++// hard `get_function` exit.
++static void drop_overwritten_functions(const LoadedSection& loaded, uint32_t start, uint32_t end) {
++    const SectionTableEntry& section = sections_info.code_sections[loaded.section_table_index];
++
++    for (size_t func_index = 0; func_index < section.num_funcs; func_index++) {
++        const auto& func = section.funcs[func_index];
++        uint32_t func_start = func.offset + loaded.loaded_ram_addr;
++        uint32_t func_end = func_start + func.rom_size;
++
++        // A function is destroyed if any part of it is overwritten -- a load that
++        // clips only its tail leaves something that must not be called.
++        if (func_start >= end || func_end <= start) {
++            continue;
++        }
++
++        auto func_it = func_map.find(func_start);
++        // As in drop_loaded_section: only drop the mapping if it still refers to
++        // this section, since a later load may already own that address.
++        if (func_it != func_map.end() && func_it->second == func.func) {
++            func_map.erase(func_it);
++            partial_eviction_funcs++;
++        }
++    }
++}
++
+ void load_overlay(size_t section_table_index, int32_t ram) {
+     const SectionTableEntry& section = sections_info.code_sections[section_table_index];
+ 
+@@ -159,7 +236,9 @@ void load_overlay(size_t section_table_index, int32_t ram) {
+     }
+ 
+     loaded_sections.emplace_back(ram, section_table_index);
+-    section_addresses[section.index] = ram;
++    if (overlay_relocation_enabled) {
++        section_addresses[section.index] = ram;
++    }
+ }
+ 
+ static void load_special_overlay(const SectionTableEntry& section, int32_t ram) {
+@@ -271,6 +350,53 @@ extern "C" void unload_overlays(int32_t ram_addr, uint32_t size) {
+     }
+ }
+ 
++// Drops whatever the range [ram_addr, ram_addr + size) destroys, section by
++// section.
++//
++// `unload_overlays` cannot express this at all: it treats a partially covered
++// section as a programming error and exits, and these overlay slots overlap
++// partially by construction.
++//
++// A section the range covers *entirely* goes as a unit. A section it covers
++// only in part keeps its identity and loses only the functions whose bytes were
++// actually overwritten -- because that is what the load did to rdram. `.file_54`
++// loads 0xA5F0 bytes at 0x803837E0, inside the 0x343A0 that `.file_56` occupies
++// from 0x80358820; that overwrites 22 of `.file_56`'s 454 functions and leaves
++// 432 of them untouched and still perfectly callable, `func_803757B0_8193D0`
++// among them. Dropping the section whole made every one of those 432 a
++// `Failed to find function` abort.
++//
++// Returns how many sections were dropped in full; the functions dropped out of
++// surviving sections are counted separately, via
++// recomp::overlays::take_partial_eviction_func_count.
++extern "C" uint32_t unload_overlapping_overlays(int32_t ram_addr, uint32_t size) {
++    uint32_t unload_start = (uint32_t)ram_addr;
++    uint32_t unload_end = unload_start + size;
++    uint32_t num_unloaded = 0;
++
++    for (auto it = loaded_sections.begin(); it != loaded_sections.end();) {
++        const auto& section = sections_info.code_sections[it->section_table_index];
++        uint32_t section_start = (uint32_t)it->loaded_ram_addr;
++        uint32_t section_end = section_start + section.size;
++
++        if (unload_start < section_end && section_start < unload_end) {
++            bool covers_whole_section = unload_start <= section_start && unload_end >= section_end;
++            if (partial_eviction_enabled && !covers_whole_section) {
++                drop_overwritten_functions(*it, unload_start, unload_end);
++                ++it;
++                continue;
++            }
++            it = drop_loaded_section(it);
++            num_unloaded++;
++            // Skip incrementing the iterator
++            continue;
++        }
++        ++it;
++    }
++
++    return num_unloaded;
++}
++
+ void recomp::overlays::init_overlays() {
+     func_map.clear();
+     section_addresses = (int32_t *)calloc(sections_info.total_num_sections, sizeof(int32_t));

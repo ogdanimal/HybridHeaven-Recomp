@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+  <background android:drawable="@mipmap/ic_launcher_background"/>
+  <foreground android:drawable="@mipmap/ic_launcher_foreground"/>
+  <!-- No monochrome layer here on purpose. The themed-icon layer wants a
+       silhouette, and this icon's artwork is a full-bleed painting with no shape
+       to cut one from, so anything derived from it automatically comes out as a
+       filled square. That reads worse in a themed launcher than simply having no
+       themed icon at all. -->
+</adaptive-icon>

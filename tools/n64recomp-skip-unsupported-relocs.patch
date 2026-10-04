@@ -1,0 +1,25 @@
+diff --git a/src/main.cpp b/src/main.cpp
+index b2816c0..09c60d2 100644
+--- a/src/main.cpp
++++ b/src/main.cpp
+@@ -962,6 +962,20 @@ int main(int argc, char** argv) {
+                         else {
+                             emit_reloc = true;
+                         }
++                        // Skip any reloc type the table cannot express. `reloc.type` is a
++                        // raw cast of the ELF's reloc type (elf.cpp), so it can hold any
++                        // value the assembler emitted, not just the eight RelocType names
++                        // -- indexing reloc_names with it is otherwise an out-of-bounds
++                        // vector read that silently emits `.type = ` and produces output
++                        // that will not compile. R_MIPS_PC16 (10) reaches here from a
++                        // branch to a global symbol in the same section, which is
++                        // position-independent and needs no runtime fixup.
++                        if (emit_reloc && static_cast<size_t>(reloc.type) >= reloc_names.size()) {
++                            fmt::print(stderr,
++                                "Warning: skipping unsupported reloc type {} at 0x{:08X} in section {}\n",
++                                static_cast<size_t>(reloc.type), reloc.address, section.name);
++                            emit_reloc = false;
++                        }
+                         if (emit_reloc) {
+                             uint32_t target_section_offset;
+                             if (reloc.target_section == N64Recomp::SectionEvent) {

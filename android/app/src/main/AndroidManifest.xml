@@ -1,0 +1,103 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+
+    <!-- ROM is chosen via SAF and copied into app-scoped storage; no legacy
+         storage permissions needed. -->
+
+    <uses-feature android:name="android.hardware.vulkan.version"
+        android:version="0x400003" android:required="true" />
+    <uses-feature android:name="android.hardware.touchscreen" android:required="false" />
+    <uses-feature android:name="android.hardware.gamepad" android:required="false" />
+
+    <application
+        android:allowBackup="true"
+        android:icon="@mipmap/ic_launcher"
+        android:label="@string/app_name"
+        android:supportsRtl="true"
+        android:isGame="true"
+        android:hasCode="true"
+        android:theme="@style/Theme.HybridHeaven"
+        tools:targetApi="31">
+
+        <!-- SDL orientation hint: landscape only, matching N64 gameplay. -->
+        <meta-data android:name="SDL_ENV.SDL_IOS_ORIENTATIONS" android:value="LandscapeLeft LandscapeRight"/>
+
+        <!-- LauncherActivity handles ROM selection/verify/copy before starting SDL. -->
+        <activity
+            android:name=".LauncherActivity"
+            android:exported="true"
+            android:excludeFromRecents="true"
+            android:screenOrientation="landscape"
+            android:configChanges="layoutDirection|locale|orientation|uiMode|screenLayout|screenSize|smallestScreenSize|keyboard|keyboardHidden|navigation"
+            android:theme="@style/Theme.HybridHeaven.Fullscreen">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <!-- MainActivity (SDLActivity) runs the recompiled game once the ROM is present.
+
+             launchMode=singleTask + a DISTINCT taskAffinity put the running game in
+             its own task, separate from LauncherActivity's default-affinity task.
+             This fixes the icon-relaunch RESTART, which was APP-INFLICTED (not a
+             system task reset — no activity here has clearTaskOnLaunch/
+             finishOnTaskLaunch, so the launcher intent's RESET_TASK_IF_NEEDED acted
+             on nothing). The old sequence: with MainActivity sharing the launcher's
+             task, tapping the icon stacked a fresh LauncherActivity onto the game
+             task and re-ran the pipeline; startGame() then did
+             startActivity(MainActivity, CLEAR_TOP|NEW_TASK), and CLEAR_TOP on a
+             *standard*-launchMode activity DESTROYS AND RECREATES it — a new process,
+             losing unsaved progress and reloading the ROM.
+
+             The two attributes fix it independently of any launcher's re-entry
+             quirks: the distinct affinity keeps the trampoline out of the game's
+             task, and singleTask makes ANY re-launch of MainActivity resolve to
+             onNewIntent on the live instance instead of destroy+recreate (so the
+             stale CLEAR_TOP in startGame is now inert). No second nativeInit — which
+             the one-way-latched native side could not survive in-process anyway. A
+             genuinely dead process still cold-starts fresh, and RestartActivity's
+             NEW_TASK|CLEAR_TASK still empties the task first, forcing a clean
+             new-process restart.
+
+             CAVEAT (open item M4): singleTask makes the game task own the recents
+             card, so a recents-tap after the process has died enters MainActivity
+             DIRECTLY, bypassing LauncherActivity's SD-volume guard. On an SD install
+             with the card removed, that boots against fallback internal storage
+             instead of the "card missing" dialog. The home-ICON path stays guarded
+             (it always runs LauncherActivity). Guarding MainActivity itself is not
+             trivial: SDLActivity's super.onCreate is mandatory and SDL_main starts on
+             the later RESUMED transition, so a finish()-in-onCreate bounce can race
+             SDL_main onto an unset data path. Tracked as M4. -->
+        <activity
+            android:name=".MainActivity"
+            android:exported="false"
+            android:launchMode="singleTask"
+            android:taskAffinity="com.hybridheaven.recomp.game"
+            android:screenOrientation="landscape"
+            android:configChanges="layoutDirection|locale|orientation|uiMode|screenLayout|screenSize|smallestScreenSize|keyboard|keyboardHidden|navigation|fontScale|density|fontWeightAdjustment|mcc|mnc|colorMode|grammaticalGender"
+            android:theme="@style/Theme.HybridHeaven.Fullscreen"/>
+
+        <!-- The optional user-supplied Vulkan driver has no activity of its own:
+             it is a category in the game's own settings menu. An earlier version
+             gave it a second launcher icon on the grounds that a driver which
+             fails to start makes an in-game setting unreachable. That is fixed by
+             the recovery path instead — the crash latch reverts a driver that
+             takes the process down, and a driver that comes up to a black screen
+             is reverted because the user never confirms the prompt they cannot
+             see — so the icon bought nothing that was worth showing every user. -->
+
+        <!-- Restart trampoline. Runs in its own process so it can kill the game
+             process from the outside and start a clean one; see RestartActivity. -->
+        <activity
+            android:name=".RestartActivity"
+            android:exported="false"
+            android:process=":restart"
+            android:screenOrientation="landscape"
+            android:excludeFromRecents="true"
+            android:noHistory="true"
+            android:theme="@style/Theme.HybridHeaven.Fullscreen"/>
+    </application>
+
+</manifest>

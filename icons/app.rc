@@ -1,0 +1,11 @@
+// The Windows executable's icon, as seen in Explorer, the taskbar and Alt-Tab.
+//
+// ONE .ico holding every size (256 down to 16), rather than Goemon64Recomp's six
+// single-size files: Windows picks the lowest-numbered ICON resource for the
+// executable and then chooses a size from inside it, so a multi-size .ico is the
+// thing that actually gets asked for and six separate resources only make the
+// first one's contents matter.
+//
+// This is not what SDL puts on the window at runtime -- see SetImageAsIcon in
+// src/main/main.cpp, which is a separate mechanism and a separate file.
+1 ICON "app.ico"

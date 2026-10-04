@@ -1,0 +1,205 @@
+#ifndef __RECOMP_UI__
+#define __RECOMP_UI__
+
+#include <cstdint>
+#include <memory>
+#include <string>
+#include <string_view>
+#include <list>
+
+// TODO move this file into src/ui
+
+#include "SDL.h"
+#include "RmlUi/Core.h"
+
+#include "../src/ui/util/hsv.h"
+#include "../src/ui/util/bem.h"
+
+#include "../src/ui/core/ui_context.h"
+
+namespace Rml {
+    class ElementDocument;
+    class EventListenerInstancer;
+    class Context;
+    class Event;
+}
+
+namespace recompui {
+    class UiEventListenerInstancer;
+
+    // TODO remove this once the UI has been ported over to the new system.
+    class MenuController {
+    public:
+        virtual ~MenuController() {}
+        virtual void load_document() = 0;
+        virtual void register_events(UiEventListenerInstancer& listener) = 0;
+        virtual void make_bindings(Rml::Context* context) = 0;
+    };
+
+    std::unique_ptr<MenuController> create_launcher_menu();
+    std::unique_ptr<MenuController> create_config_menu();
+
+    using event_handler_t = void(const std::string& param, Rml::Event&);
+
+    void queue_event(const SDL_Event& event);
+    bool try_deque_event(SDL_Event& out);
+
+    std::unique_ptr<UiEventListenerInstancer> make_event_listener_instancer();
+    void register_event(UiEventListenerInstancer& listener, const std::string& name, event_handler_t* handler);
+
+    void show_context(ContextId context, std::string_view param);
+    void hide_context(ContextId context);
+    void hide_all_contexts();
+    bool is_context_shown(ContextId context);
+    bool is_context_capturing_input();
+    bool is_context_capturing_mouse();
+    bool is_any_context_shown();
+    ContextId try_close_current_context();
+    // Geometry RmlUi has handed the render interface since the last call, then
+    // zeroed. This is the port's evidence that the UI actually drew, on a machine
+    // that cannot look at the screen: WSLg parks the window somewhere invisible
+    // often enough that not seeing it proves nothing, and screenshots do not work
+    // from the guest. Defined in ui_renderer.cpp, reported by HH_TRACE_UI.
+    void debug_take_geometry_counts(uint64_t* batches, uint64_t* vertices);
+
+
+    ContextId get_launcher_context_id();
+    ContextId get_config_context_id();
+    ContextId get_config_sub_menu_context_id();
+    // Either of the two above, shown. Exists as a bool-returning function so the
+    // non-UI HybridHeavenRuntime can ask without including this header -- see the
+    // forward declaration in src/game/recomp_api.cpp. Read by the timed autosave.
+    bool is_config_menu_open();
+
+    enum class ConfigTab {
+        General,
+        Controls,
+        Graphics,
+        Sound,
+        Mods,
+        Saves,
+        // Last on purpose: it is conditional (Android, and only in a build that
+        // can load a user-supplied Vulkan driver), and a hidden tab in the
+        // middle would leave a gap in the tabset's own indices.
+        Driver,
+    };
+
+    // Shows/hides the config menu's restart button. Cheap to call per frame; it
+    // only touches the DOM when the answer changes. See the definition.
+    void sync_restart_button_visibility();
+
+    // Runs the callbacks for any file the user has picked on a platform whose file
+    // dialog is asynchronous (Android). A no-op elsewhere, where the dialog blocks
+    // and its callback has already run. Render thread, once per frame.
+    void pump_file_dialogs();
+
+    // Drives the user-supplied Vulkan driver's confirm-to-keep recovery: asks the
+    // user to confirm a driver that has not been confirmed before, and reports a
+    // confirmed one as having survived once the renderer has proved it is alive.
+    // A no-op unless a driver could be loaded at all. Render thread, once per frame.
+    void tick_gpu_driver();
+
+    // Keeps the Saves tab's import availability in step with whether the game
+    // has started. Render thread, once per frame.
+    void tick_saves();
+
+    void set_config_tab(ConfigTab tab);
+    int config_tab_to_index(ConfigTab tab);
+    Rml::ElementTabSet* get_config_tabset();
+    Rml::Element* get_mod_tab();
+    void set_config_tabset_mod_nav();
+    void focus_mod_configure_button();
+
+    enum class ButtonVariant {
+        Primary,
+        Secondary,
+        Tertiary,
+        Success,
+        Error,
+        Warning,
+        NumVariants,
+    };
+
+    void init_styling(const std::filesystem::path& rcss_file);
+    void init_prompt_context();
+    void open_choice_prompt(
+        const std::string& header_text,
+        const std::string& content_text,
+        const std::string& confirm_label_text,
+        const std::string& cancel_label_text,
+        std::function<void()> confirm_action,
+        std::function<void()> cancel_action,
+        ButtonVariant confirm_variant = ButtonVariant::Success,
+        ButtonVariant cancel_variant = ButtonVariant::Error,
+        bool focus_on_cancel = true,
+        const std::string& return_element_id = ""
+    );
+    // Three-button variant of open_choice_prompt. Buttons are laid out
+    // confirm | extra | cancel, so the "safe" option stays rightmost where the
+    // two-button prompts already put Cancel.
+    void open_three_choice_prompt(
+        const std::string& header_text,
+        const std::string& content_text,
+        const std::string& confirm_label_text,
+        const std::string& extra_label_text,
+        const std::string& cancel_label_text,
+        std::function<void()> confirm_action,
+        std::function<void()> extra_action,
+        std::function<void()> cancel_action,
+        ButtonVariant confirm_variant = ButtonVariant::Success,
+        ButtonVariant extra_variant = ButtonVariant::Warning,
+        ButtonVariant cancel_variant = ButtonVariant::Error,
+        bool focus_on_cancel = true,
+        const std::string& return_element_id = ""
+    );
+    void open_info_prompt(
+        const std::string& header_text,
+        const std::string& content_text,
+        const std::string& okay_label_text,
+        std::function<void()> okay_action,
+        ButtonVariant okay_variant = ButtonVariant::Error,
+        const std::string& return_element_id = ""
+    );
+    void open_notification(
+        const std::string& header_text,
+        const std::string& content_text,
+        const std::string& return_element_id = ""
+    );
+    void close_prompt();
+    bool is_prompt_open();
+
+    // Transient "Saved" toast over gameplay. show_ is guest-thread safe;
+    // init_/tick_ are render-thread only. See ui_saved_indicator.cpp.
+    void init_saved_indicator_context();
+    void show_saved_indicator();
+    void tick_saved_indicator();
+    void update_mod_list(bool scan_mods = true);
+    void process_game_started();
+
+    void apply_color_hack();
+    void get_window_size(int& width, int& height);
+    void set_cursor_visible(bool visible);
+    void update_supported_options();
+    void toggle_fullscreen();
+
+    bool get_cont_active(void);
+    void set_cont_active(bool active);
+    void activate_mouse();
+
+    void message_box(const char* msg);
+
+    void set_render_hooks();
+
+    Rml::ElementPtr create_custom_element(Rml::Element* parent, std::string tag);
+    Rml::ElementDocument* load_document(const std::filesystem::path& path);
+    Rml::ElementDocument* create_empty_document();
+    Rml::Element* get_child_by_tag(Rml::Element* parent, const std::string& tag);
+
+    void queue_image_from_bytes_rgba32(const std::string &src, const std::vector<char> &bytes, uint32_t width, uint32_t height);
+    void queue_image_from_bytes_file(const std::string &src, const std::vector<char> &bytes);
+    void release_image(const std::string &src);
+
+    void drop_files(const std::list<std::filesystem::path> &file_list);
+}
+
+#endif

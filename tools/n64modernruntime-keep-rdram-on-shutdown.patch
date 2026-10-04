@@ -1,0 +1,36 @@
+diff --git a/librecomp/src/recomp.cpp b/librecomp/src/recomp.cpp
+index a8f64d5..a98acc4 100644
+--- a/librecomp/src/recomp.cpp
++++ b/librecomp/src/recomp.cpp
+@@ -852,17 +852,18 @@ void recomp::start(
+     ultramodern::join_thread_cleaner_thread();
+     ultramodern::join_saving_thread();
+     
+-    // Free rdram.
+-    bool free_failed;
+-#ifdef _WIN32
+-    // VirtualFree returns zero on failure.
+-    free_failed = (VirtualFree(rdram, 0, MEM_RELEASE) == 0);
+-#else
+-    // munmap returns -1 on failure.
+-    free_failed = (munmap(rdram, allocation_size) == -1);
+-#endif
+-
+-    if (free_failed) {
+-        printf("Failed to free rdram\n");
+-    }
++    // Deliberately do NOT free rdram here.
++    //
++    // The joins above cover this library's threads and ultramodern's, but not the
++    // threads the *game* created through osCreateThread. Those exit by throwing
++    // ultramodern::thread_terminated the next time they reach a scheduling point,
++    // and nothing waits for that to happen. Freeing rdram pulls the memory out
++    // from under whichever one is still mid-instruction, so every quit ends in a
++    // SIGSEGV at an ordinary-looking game address -- indistinguishable from a
++    // real crash, and expensive to chase. It cost this port a while.
++    //
++    // The allocation is reserved rather than committed and the process is on its
++    // way out, so leaving it to exit() costs nothing. Restore the free once game
++    // threads are joined instead of abandoned.
++    (void)rdram;
+ }
