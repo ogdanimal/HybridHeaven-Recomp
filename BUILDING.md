@@ -295,6 +295,7 @@ ROM, an ELF or generated game source.
 
 | secret | used by | holds |
 |---|---|---|
+| `HH_ARTIFACT_KEY` | both | any long random string (`openssl rand -base64 48`). Encrypts the `codegen` artifact, which holds the game's code as C, because a public repo's artifacts are downloadable by anyone signed in. Nobody needs to know it |
 | `HHRS_REPO_WITH_PAT` | both | `https://x-access-token:<PAT>@github.com/ogdanimal/HybridHeaven-RecompSecrets.git` — the ROM repo |
 | `RELEASE_KEYSTORE_BASE64` | release | `base64 -w0 release.jks` |
 | `RELEASE_STORE_PASSWORD` | release | keystore password |
