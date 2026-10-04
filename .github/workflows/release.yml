@@ -202,13 +202,15 @@ jobs:
           **You need your own Hybrid Heaven (USA) cartridge dump** -- sha1
           `16dbc21620b52deab5c5abf8a309ac60adfbee85`. Nothing here contains game data.
 
-          - **Windows**: unzip and run `HybridHeavenRecompiled.exe`. Needs a Vulkan GPU.
+          - **Windows**: unzip and run `HybridHeavenRecompiled.exe`. Needs a GPU with
+            Direct3D 12 or Vulkan.
           - **Linux**: extract, then run `./HybridHeavenRecompiled` from inside the
             folder. Needs SDL2 and GTK 3 (`libsdl2-2.0-0`, `libgtk-3-0`) and a Vulkan GPU.
-          - **Android**: install the APK (Android 9+, arm64, Vulkan). Replacing a
-            debug build needs an uninstall first -- the signatures differ -- and an
-            uninstall DELETES the app's saves. Copy `hybridheaven.us.bin` off the
-            device before uninstalling, then bring it back with Settings -> Saves.
+          - **Android**: install the APK over your current one -- saves are kept
+            (Android 9+, arm64, Vulkan, and a gamepad). An APK you built yourself is
+            signed differently and must be uninstalled first, which DELETES the
+            app's saves: copy `hybridheaven.us.bin` off the device before
+            uninstalling, then bring it back with Settings -> Saves.
           EOF
           gh release create "$GITHUB_REF_NAME" out/* \
             --repo "$GITHUB_REPOSITORY" \
