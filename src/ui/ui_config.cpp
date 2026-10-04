@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <cmath>
 
 #include "recomp_ui.h"
 #include "recomp_input.h"
@@ -371,6 +372,8 @@ struct ControlOptionsContext {
     std::atomic<int> joystick_deadzone; // 0 to 100
     std::atomic<recomp::BackgroundInputMode> background_input_mode;
     std::atomic<hybridheaven::AnalogCamMode> analog_cam_mode;
+    std::atomic<hybridheaven::TouchControlsMode> touch_controls_mode;
+    std::atomic<int> touch_stick_sensitivity; // 0 to 100, lower = finer near centre
     std::atomic<hybridheaven::CameraInvertMode> analog_camera_invert_mode;
     std::atomic<int> analog_cam_sensitivity_x; // 0 to 100, 50 = default rate
     std::atomic<int> analog_cam_sensitivity_y; // 0 to 100, 50 = default rate
@@ -378,6 +381,15 @@ struct ControlOptionsContext {
 };
 
 ControlOptionsContext control_options_context;
+
+// Whether on-screen controls exist on this platform. A plain bool rather than a
+// compile-time constant in the RML, because RmlUi data bindings need something to
+// point at.
+#if defined(__ANDROID__)
+bool touch_supported = true;
+#else
+bool touch_supported = false;
+#endif
 
 int recomp::get_rumble_strength() {
     return control_options_context.rumble_strength;
@@ -455,6 +467,28 @@ void hybridheaven::set_analog_cam_mode(hybridheaven::AnalogCamMode mode) {
     control_options_context.analog_cam_mode = mode;
     if (general_model_handle) {
         general_model_handle.DirtyVariable("analog_cam_mode");
+    }
+}
+
+hybridheaven::TouchControlsMode hybridheaven::get_touch_controls_mode() {
+    return control_options_context.touch_controls_mode;
+}
+
+void hybridheaven::set_touch_controls_mode(hybridheaven::TouchControlsMode mode) {
+    control_options_context.touch_controls_mode = mode;
+    if (general_model_handle) {
+        general_model_handle.DirtyVariable("touch_controls_mode");
+    }
+}
+
+int hybridheaven::get_touch_stick_sensitivity() {
+    return control_options_context.touch_stick_sensitivity;
+}
+
+void hybridheaven::set_touch_stick_sensitivity(int value) {
+    control_options_context.touch_stick_sensitivity = std::clamp(value, 0, 100);
+    if (general_model_handle) {
+        general_model_handle.DirtyVariable("touch_stick_sensitivity");
     }
 }
 
@@ -564,10 +598,98 @@ Rml::Element* recompui::get_child_by_tag(Rml::Element* parent, const std::string
     return nullptr;
 }
 
+// Lets the tab strip be dragged sideways.
+//
+// The strip scrolls horizontally because, with the Touch tab on Android, the tabs
+// no longer fit beside the icon buttons, and RmlUi 6.0 only scrolls on the wheel or
+// the scrollbar -- a touch swipe arrives (via SDL's touch-to-mouse emulation) as a
+// press and a move, which RmlUi treats as hover. So the drag is done here: press
+// anywhere on the strip, move past a small threshold, and the strip follows the
+// finger.
+//
+// The click that ends a drag is swallowed, so dragging never switches tabs. A tap
+// that stays under the threshold is an ordinary click and selects the tab as before.
+class TabStripDragScroller : public Rml::EventListener {
+public:
+    void attach(Rml::Element* tabs) {
+        strip = tabs;
+        // Capture phase on the strip: the click has to be stopped before it reaches
+        // the tab, and before the tabset's default action, which is what switches tabs.
+        strip->AddEventListener(Rml::EventId::Mousedown, this, true);
+        strip->AddEventListener(Rml::EventId::Click, this, true);
+        // Move and release are taken on the whole document, so a drag that leaves the
+        // strip's bounds keeps scrolling and still ends cleanly.
+        Rml::ElementDocument* doc = strip->GetOwnerDocument();
+        doc->AddEventListener(Rml::EventId::Mousemove, this, true);
+        doc->AddEventListener(Rml::EventId::Mouseup, this, true);
+    }
+
+    void ProcessEvent(Rml::Event& event) override {
+        switch (event.GetId()) {
+            case Rml::EventId::Mousedown:
+                if (event.GetParameter<int>("button", -1) == 0) {
+                    pressed = true;
+                    dragged = false;
+                    press_x = event.GetParameter<float>("mouse_x", 0.0f);
+                    press_scroll = strip->GetScrollLeft();
+                }
+                break;
+            case Rml::EventId::Mousemove:
+                if (pressed) {
+                    float dx = event.GetParameter<float>("mouse_x", press_x) - press_x;
+                    if (!dragged && std::fabs(dx) > drag_threshold_px()) {
+                        dragged = true;
+                    }
+                    if (dragged) {
+                        strip->SetScrollLeft(press_scroll - dx);
+                    }
+                }
+                break;
+            case Rml::EventId::Mouseup:
+                // dragged is left set: the click for this release is dispatched after
+                // the mouseup, and it is what clears the flag.
+                pressed = false;
+                break;
+            case Rml::EventId::Click:
+                if (dragged) {
+                    dragged = false;
+                    event.StopPropagation();
+                }
+                break;
+            default:
+                break;
+        }
+    }
+
+private:
+    float drag_threshold_px() const {
+        Rml::Context* context = strip->GetContext();
+        float ratio = context != nullptr ? context->GetDensityIndependentPixelRatio() : 1.0f;
+        return 12.0f * ratio;
+    }
+
+    Rml::Element* strip = nullptr;
+    bool pressed = false;
+    bool dragged = false;
+    float press_x = 0.0f;
+    float press_scroll = 0.0f;
+};
+
 class ConfigTabsetListener : public Rml::EventListener {
     void ProcessEvent(Rml::Event& event) override {
         if (event.GetId() == Rml::EventId::Tabchange) {
             int tab_index = event.GetParameter<int>("tab_index", 0);
+            // The strip scrolls, so a tab chosen by controller, by the shoulder
+            // buttons or from code may be off the edge. Bring it into view.
+            // Controller focus already does this for the tab it lands on; this
+            // covers every other way the active tab changes.
+            {
+                Rml::Element* tabs = recompui::get_child_by_tag(recompui::get_config_tabset(), "tabs");
+                if (tabs != nullptr && tab_index >= 0 && tab_index < tabs->GetNumChildren()) {
+                    tabs->GetChild(tab_index)->ScrollIntoView(
+                        Rml::ScrollIntoViewOptions{Rml::ScrollAlignment::Nearest, Rml::ScrollAlignment::Nearest});
+                }
+            }
             bool in_mod_tab = (tab_index == recompui::config_tab_to_index(recompui::ConfigTab::Mods));
             if (in_mod_tab) {
                 recompui::set_config_tabset_mod_nav();
@@ -589,6 +711,7 @@ class ConfigTabsetListener : public Rml::EventListener {
 class ConfigMenu : public recompui::MenuController {
 private:
     ConfigTabsetListener config_tabset_listener;
+    TabStripDragScroller tab_strip_scroller;
 public:
     ConfigMenu() {
 
@@ -599,7 +722,11 @@ public:
     void load_document() override {
 		config_context = recompui::create_context(hybridheaven::get_asset_path("config_menu.rml"));
         recompui::update_mod_list(false);
-        recompui::get_config_tabset()->AddEventListener(Rml::EventId::Tabchange, &config_tabset_listener);
+        Rml::ElementTabSet* tabset = recompui::get_config_tabset();
+        tabset->AddEventListener(Rml::EventId::Tabchange, &config_tabset_listener);
+        if (Rml::Element* tabs = recompui::get_child_by_tag(tabset, "tabs")) {
+            tab_strip_scroller.attach(tabs);
+        }
     }
     void register_events(recompui::UiEventListenerInstancer& listener) override {
         recompui::register_event(listener, "apply_options",
@@ -658,6 +785,20 @@ public:
         // tab is not carried over.
 
         recompui::register_gpu_driver_events(listener);
+
+#if defined(__ANDROID__)
+        // Hands off to the Android side, which puts the live overlay into edit mode
+        // over the running game. The editor is deliberately the real overlay rather
+        // than a mock: the only question it answers is "can my thumb reach that",
+        // and a mock at a different size, without the game behind it, cannot answer
+        // that. Closes the menu first for the same reason -- you cannot judge a
+        // layout you cannot see.
+        recompui::register_event(listener, "touch_edit_layout",
+            [](const std::string& /*param*/, Rml::Event& /*event*/) {
+                recompui::hide_all_contexts();
+                hybridheaven::request_touch_layout_editor();
+            });
+#endif
         recompui::register_saves_events(listener);
     }
 
@@ -1040,6 +1181,15 @@ public:
         bind_atomic(constructor, general_model_handle, "joystick_deadzone", &control_options_context.joystick_deadzone);
         bind_atomic_option(constructor, "background_input_mode", &control_options_context.background_input_mode);
         bind_atomic_option(constructor, "analog_cam_mode", &control_options_context.analog_cam_mode);
+        bind_atomic_option(constructor, "touch_controls_mode", &control_options_context.touch_controls_mode);
+        // Gates the Touch tab, the same way driver_supported gates the GPU Driver
+        // tab. The tab's only action -- touch_edit_layout -- is registered inside
+        // #if defined(__ANDROID__), so without this a desktop build would show a tab
+        // whose button resolves to no listener and silently does nothing, next to a
+        // setting that drives nothing.
+        constructor.Bind("touch_supported", &touch_supported);
+        bind_atomic(constructor, general_model_handle, "touch_stick_sensitivity",
+                    &control_options_context.touch_stick_sensitivity);
         bind_atomic_option(constructor, "analog_camera_invert_mode", &control_options_context.analog_camera_invert_mode);
         bind_atomic(constructor, general_model_handle, "analog_cam_sensitivity_x", &control_options_context.analog_cam_sensitivity_x);
         bind_atomic(constructor, general_model_handle, "analog_cam_sensitivity_y", &control_options_context.analog_cam_sensitivity_y);

@@ -39,7 +39,7 @@ No build includes the game. You'll need your own legally obtained ROM.
 | **Linux** | A Vulkan-capable GPU, plus SDL2 and GTK 3 (`libsdl2-2.0-0`, `libgtk-3-0` on Debian/Ubuntu) |
 | **Android** | 9.0+, a 64-bit (`arm64-v8a`) device, and a Vulkan-capable GPU |
 
-Keyboard and gamepad both work on desktop. **On Android you need a gamepad** — there are no on-screen controls yet, so a handheld's built-in controls work as-is but a phone needs a physical or Bluetooth pad.
+Keyboard and gamepad both work on desktop. On Android a handheld's built-in controls work as-is, a physical or Bluetooth pad works, and a phone with neither gets [on-screen touch controls](#on-screen-controls).
 
 Tested on a **Retroid Pocket 5** (Android 13, Snapdragon 865) and on Windows with an RTX 5080 (Direct3D 12 and Vulkan).
 
@@ -115,6 +115,7 @@ Everything below is opt-in and lives in the in-game settings menu.
 - **Mods** — the mod menu is present (**Settings → Mods**).
 - **Import a save** — see below.
 - **GPU Driver** *(Android)* — see below.
+- **On-Screen Controls** *(Android)* — see below. On by default, but only until a gamepad is used.
 
 ### Importing a Save
 
@@ -137,6 +138,24 @@ On Adreno devices, **Settings → GPU Driver** lets you load a different Vulkan 
 Import a driver `.adpkg` or `.so` through the file picker and restart when asked. [Mr. Purple's purple-turnip](https://github.com/MrPurple666/purple-turnip/releases) builds are the usual source for Adreno handhelds; which build works best depends on your chip and Android version, and no particular build has been tested with Hybrid Heaven yet. A driver that doesn't work costs you nothing but a restart: the app confirms a new driver actually works before keeping it, and falls back to the system driver otherwise.
 
 The available replacement drivers are Adreno/Qualcomm builds, so there's nothing useful to import on Mali or other hardware.
+
+### On-Screen Controls
+
+<a id="on-screen-controls"></a>
+
+*Android only. Contributed to [Goemon64Recomp-Android](https://github.com/ogdanimal/Goemon64Recomp-Android) by [@epic-ship-it](https://github.com/epic-ship-it) in [#25](https://github.com/ogdanimal/Goemon64Recomp-Android/pull/25), and ported here.*
+
+On a device with no gamepad, a full N64 pad is drawn over the game: analog stick under the left thumb, A and B under the right with the C-buttons above them, Z in the top-left corner and L/R top right, and Start in the middle.
+
+By default it **hides as soon as a gamepad is used** and comes back the next time you touch the screen, so a handheld with real controls never has it in the way and a phone never has to go looking for a setting.
+
+Whether it appears at all is under **Settings → Touch → On-Screen Controls** (Auto / On / Off). The same tab has **Stick Sensitivity**, which softens the stick near its centre so slow walking is easy to hold on a small screen without losing top speed, and **Edit Layout**, which lets you drag the controls wherever your hands want them, over the running game. Touch is the last tab; if it is off the edge of the screen, drag the row of tabs sideways to reach it.
+
+**Long-press the ☰ handle** for size, opacity and vibration. A short tap on ☰ opens this app's settings menu (☰ is the on-screen stand-in for Select).
+
+The on-screen buttons go through the same bindings as a physical controller, so anything you remap in **Settings → Controls** moves them too, and they work alongside a real pad rather than instead of it. There is no on-screen right stick, so **Analog Camera** needs a gamepad; the on-screen C-buttons still turn the game's own camera.
+
+Full detail: [`docs/touch-controls.md`](docs/touch-controls.md).
 
 ## Troubleshooting Details
 
@@ -184,6 +203,7 @@ See **[BUILDING.md](BUILDING.md)** for the full step-by-step for all three platf
 - [Goemon 64: Recompiled](https://github.com/klorfmorf/Goemon64Recomp) contributors — this port's launcher, settings menus and input layer are theirs
 - [Goemon64Recomp-Android](https://github.com/ogdanimal/Goemon64Recomp-Android), whose Android layer this port's comes from, and [@linkzenic](https://github.com/linkzenic)'s [Zelda64Recomp-Android](https://github.com/linkzenic/Zelda64Recomp-Android), which paved the way for it
 - [Zelda64Recomp](https://github.com/Zelda64Recomp/Zelda64Recomp), the base those projects build on
+- [@epic-ship-it](https://github.com/epic-ship-it) — the [on-screen touch controls](#on-screen-controls), written for Goemon64Recomp-Android ([#25](https://github.com/ogdanimal/Goemon64Recomp-Android/pull/25))
 - The [mnsg](https://github.com/klorfmorf/mnsg) decompilation of Mystical Ninja Starring Goemon, whose archive tooling made Hybrid Heaven's ROM format tractable
 - SDL contributors
 

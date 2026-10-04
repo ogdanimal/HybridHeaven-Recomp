@@ -65,6 +65,45 @@ namespace hybridheaven {
     AnalogCamMode get_analog_cam_mode();
     void set_analog_cam_mode(AnalogCamMode mode);
 
+    // On-screen (touch) controls, Android only. Lives in the shared config rather
+    // than on the Android side so the game's own menu can bind it like any other
+    // option -- that is where a player looks for it, and it keeps one source of
+    // truth for whether the overlay is on. The Java layer reads it back over JNI.
+    //
+    // Auto is listed first deliberately: NLOHMANN_JSON_SERIALIZE_ENUM maps an
+    // unknown or wrong-typed value to the first entry, and Auto is the safe landing
+    // spot -- a corrupt config leaves a phone with usable controls and a handheld
+    // with its screen clear.
+    enum class TouchControlsMode {
+        Auto, // shown until a gamepad is used, then hidden until the screen is touched
+        On,   // always drawn, even with a controller attached
+        Off,  // never drawn -- the controller-only behaviour the app shipped with
+        OptionCount
+    };
+
+    NLOHMANN_JSON_SERIALIZE_ENUM(hybridheaven::TouchControlsMode, {
+        {hybridheaven::TouchControlsMode::Auto, "Auto"},
+        {hybridheaven::TouchControlsMode::On, "On"},
+        {hybridheaven::TouchControlsMode::Off, "Off"}
+    });
+
+    TouchControlsMode get_touch_controls_mode();
+    void set_touch_controls_mode(TouchControlsMode mode);
+
+    // How directly the on-screen stick follows the thumb, 0..100.
+    //
+    // 100 is linear -- the deflection sent is simply how far the thumb is from the
+    // centre. That is the twitchy end, and it is twitchy for a concrete reason: the
+    // stick is about 9 mm across on a 450 dpi phone, so a linear response puts the
+    // entire walking range inside roughly 4.5 mm of travel and slow movement is
+    // almost impossible to hold.
+    //
+    // Lower values bend the response, so thumb movement near the centre produces
+    // proportionally less deflection while the rim still reaches full tilt. That buys
+    // back the walking range without making the stick bigger or costing any top speed.
+    int get_touch_stick_sensitivity();
+    void set_touch_stick_sensitivity(int value);
+
     enum class CameraInvertMode {
         InvertNone,
         InvertX,

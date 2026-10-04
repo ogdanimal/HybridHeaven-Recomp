@@ -282,6 +282,8 @@ bool save_general_config(const std::filesystem::path& path) {
     config_json["joystick_deadzone"] = recomp::get_joystick_deadzone();
     config_json["debug_mode"] = hybridheaven::get_debug_mode_enabled();
     config_json["analog_cam_mode"] = hybridheaven::get_analog_cam_mode();
+    config_json["touch_controls_mode"] = hybridheaven::get_touch_controls_mode();
+    config_json["touch_stick_sensitivity"] = hybridheaven::get_touch_stick_sensitivity();
     config_json["analog_camera_invert_mode"] = hybridheaven::get_analog_camera_invert_mode();
     config_json["analog_cam_sensitivity_x"] = hybridheaven::get_analog_cam_sensitivity_x();
     config_json["analog_cam_sensitivity_y"] = hybridheaven::get_analog_cam_sensitivity_y();
@@ -305,6 +307,12 @@ void set_general_settings_from_json(const nlohmann::json& config_json) {
     hybridheaven::set_analog_camera_invert_mode(from_or_default(config_json, "analog_camera_invert_mode", hybridheaven::CameraInvertMode::InvertNone));
     hybridheaven::set_analog_cam_sensitivity_x(from_or_default(config_json, "analog_cam_sensitivity_x", 50));
     hybridheaven::set_analog_cam_sensitivity_y(from_or_default(config_json, "analog_cam_sensitivity_y", 50));
+    // Auto, so a phone gets usable controls on first launch and a handheld's screen
+    // clears the moment its own buttons are used.
+    hybridheaven::set_touch_controls_mode(from_or_default(config_json, "touch_controls_mode", hybridheaven::TouchControlsMode::Auto));
+    // 50 rather than 100: a linear stick is measurably too twitchy to walk with on a
+    // phone-sized overlay, so the shipped default already bends the response.
+    hybridheaven::set_touch_stick_sensitivity(from_or_default(config_json, "touch_stick_sensitivity", 50));
     // Autosave defaults OFF, and unlike the analog camera that is not merely
     // conservative: this feature overwrites the player's real save slot through
     // a call into the game's own save routine. The default applies only when the

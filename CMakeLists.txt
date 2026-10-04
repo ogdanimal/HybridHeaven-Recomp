@@ -560,12 +560,14 @@ target_sources(HybridHeavenRecompiled PRIVATE
 )
 
 # The Android-only translation units: the SDL_main/JNI bootstrap that SDLActivity
-# enters through, and the crash classifier that stands in for the backtrace
-# handler in main.cpp (which has no useful output on a device).
+# enters through, the crash classifier that stands in for the backtrace
+# handler in main.cpp (which has no useful output on a device), and the native
+# half of the on-screen touch controls.
 if(ANDROID)
     target_sources(HybridHeavenRecompiled PRIVATE
         ${CMAKE_SOURCE_DIR}/src/main/android_glue.cpp
         ${CMAKE_SOURCE_DIR}/src/main/android_diag.cpp
+        ${CMAKE_SOURCE_DIR}/src/main/android_touch.cpp
     )
 endif()
 
