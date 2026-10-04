@@ -207,7 +207,7 @@ jobs:
           - **Linux**: extract, then run `./HybridHeavenRecompiled` from inside the
             folder. Needs SDL2 and GTK 3 (`libsdl2-2.0-0`, `libgtk-3-0`) and a Vulkan GPU.
           - **Android**: install the APK over your current one -- saves are kept
-            (Android 9+, arm64, Vulkan, and a gamepad). An APK you built yourself is
+            (Android 9+, arm64, Vulkan). An APK you built yourself is
             signed differently and must be uninstalled first, which DELETES the
             app's saves: copy `hybridheaven.us.bin` off the device before
             uninstalling, then bring it back with Settings -> Saves.

@@ -5,7 +5,8 @@ so a plain phone can play, without changing anything for a handheld that already
 sticks.
 
 Ported from [Goemon 64: Recompiled](https://github.com/ogdanimal/Goemon64Recomp-Android),
-where the overlay was contributed by [epic-ship-it](https://github.com/epic-ship-it).
+where the overlay was contributed by [@epic-ship-it](https://github.com/epic-ship-it) in
+[#25](https://github.com/ogdanimal/Goemon64Recomp-Android/pull/25).
 The two ports share their Android layer and input path, so the code is the same apart
 from names; what is specific to Hybrid Heaven is the action column of the table below.
 

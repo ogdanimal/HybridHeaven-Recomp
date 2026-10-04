@@ -5,6 +5,10 @@
 
 // On-screen ("tactile") controls for touchscreen devices.
 //
+// Written by epic-ship-it (https://github.com/epic-ship-it) for
+// Goemon64Recomp-Android, ogdanimal/Goemon64Recomp-Android#25, and ported here
+// with the Java side in android/.../recomp/touch/. See docs/touch-controls.md.
+//
 // The overlay itself is drawn and hit-tested in Java (TouchOverlayView), because
 // nothing about it needs the renderer: it is a plain Android View composited over
 // SDL's SurfaceView, so layout changes never require an NDK rebuild
