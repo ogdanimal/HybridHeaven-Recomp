@@ -1,0 +1,20 @@
+{
+  "$schema": "https://recomp.fyi/schema/v1.json",
+  "game": "Hybrid Heaven",
+  "wikidata": "Q3143650",
+  "system": "N64",
+  "type": "recomp",
+  "status": "released",
+  "targets": ["Windows", "Linux", "Android"],
+  "toolchain": ["N64recomp", "N64ModernRuntime", "RT64"],
+  "original": { "region": "USA", "sha1": "16dbc21620b52deab5c5abf8a309ac60adfbee85" },
+  "project": "Hybrid Heaven: Recompiled",
+  "approach": "N64Recomp static recompilation built from the game's decompilation, on N64ModernRuntime with RT64 rendering",
+  "maintainers": [{ "name": "ogdanimal", "link": "https://github.com/ogdanimal" }],
+  "links": [
+    { "label": "Releases", "url": "https://github.com/ogdanimal/HybridHeaven-Recomp/releases" },
+    { "label": "Decompilation", "url": "https://github.com/ogdanimal/HybridHeaven-Decomp" }
+  ],
+  "tags": ["widescreen", "analog-camera", "autosave", "touch-controls"],
+  "notes": "Native Windows, Linux and Android (arm64, Vulkan) builds. Widescreen, higher internal resolutions, analog camera, autosave, save import, on-screen touch controls and an Adreno GPU driver loader on Android. Bring your own USA cartridge; no game data ships in any build."
+}
